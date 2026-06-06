@@ -47,6 +47,8 @@ SETTING_KEYS: tuple[str, ...] = (
     "previewEvery",
     "randomSamples",
     "preprocessMode",
+    "lumaLevels",
+    "edgeAwareStrength",
     "saveAt",
     "saveEvery",
     "stopAt",
@@ -340,11 +342,30 @@ def preprocess_input_image(
     except OSError:
         pass
 
+    values = setting.values or {}
     if mode == "luma_band":
         # Delayed import to avoid circular deps at module load time.
         luma_band = __import__("preprocess.luma", fromlist=["luma_band"]).luma_band
+        levels = _parse_float(values.get("lumaLevels"))
+        if levels is not None and levels >= 2:
+            return luma_band(image_path, levels=levels)
         return luma_band(image_path)
+    if mode == "edge_aware":
+        edge_aware = __import__("preprocess.edge", fromlist=["edge_aware"]).edge_aware
+        strength = _parse_float(values.get("edgeAwareStrength"))
+        if strength is not None:
+            return edge_aware(image_path, strength=strength)
+        return edge_aware(image_path)
     raise PreprocessError(f"unsupported preprocess mode: {mode}")
+
+
+def _parse_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -8,12 +8,20 @@ from utils import clamp_byte
 
 
 class ShapeType(IntEnum):
+    # Values match geometrize's power-of-two shape flags so a forked generator's
+    # JSON maps 1:1. RECTANGLE=1, ROTATED_RECTANGLE=2, TRIANGLE=4, ELLIPSE=8,
+    # ROTATED_ELLIPSE=16. Only RECTANGLE/TRIANGLE/ROTATED_ELLIPSE are drawable in
+    # FH6 (ROTATED_RECTANGLE is normalized to a rotated RECTANGLE — see S1).
     RECTANGLE = 1
+    ROTATED_RECTANGLE = 2
+    TRIANGLE = 4
     ROTATED_ELLIPSE = 16
 
 
 # Backwards-compatible module-level aliases.
 RECTANGLE = ShapeType.RECTANGLE
+ROTATED_RECTANGLE = ShapeType.ROTATED_RECTANGLE
+TRIANGLE = ShapeType.TRIANGLE
 ROTATED_ELLIPSE = ShapeType.ROTATED_ELLIPSE
 
 
@@ -22,6 +30,14 @@ TYPE_ALIASES = {
     "rect": ShapeType.RECTANGLE,
     "rectangle": ShapeType.RECTANGLE,
     "box": ShapeType.RECTANGLE,
+    "2": ShapeType.ROTATED_RECTANGLE,
+    "rotatedrect": ShapeType.ROTATED_RECTANGLE,
+    "rotated_rect": ShapeType.ROTATED_RECTANGLE,
+    "rotated rectangle": ShapeType.ROTATED_RECTANGLE,
+    "rotated_rectangle": ShapeType.ROTATED_RECTANGLE,
+    "4": ShapeType.TRIANGLE,
+    "tri": ShapeType.TRIANGLE,
+    "triangle": ShapeType.TRIANGLE,
     "16": ShapeType.ROTATED_ELLIPSE,
     "ellipse": ShapeType.ROTATED_ELLIPSE,
     "ellipsis": ShapeType.ROTATED_ELLIPSE,
@@ -80,7 +96,7 @@ def drawable_shape_count(path):
         color = shape.get("color", [])
         if len(color) == 4 and int(color[3]) <= 0:
             continue
-        if int(shape.get("type", 0)) in (ShapeType.RECTANGLE, ShapeType.ROTATED_ELLIPSE):
+        if int(shape.get("type", 0)) in (ShapeType.RECTANGLE, ShapeType.TRIANGLE, ShapeType.ROTATED_ELLIPSE):
             count += 1
     return count
 
@@ -107,14 +123,16 @@ def _normalize_shape(shape):
     if not isinstance(shape, dict):
         return None
     type_id = _normalize_type(_pick(shape, "type", "Type", "shapeType", "ShapeType", "primitive", "Primitive"))
-    if type_id not in (ShapeType.RECTANGLE, ShapeType.ROTATED_ELLIPSE):
+    if type_id not in (ShapeType.RECTANGLE, ShapeType.ROTATED_RECTANGLE, ShapeType.TRIANGLE, ShapeType.ROTATED_ELLIPSE):
         return None
     data = _normalize_data(shape, type_id)
     color = _normalize_color(_pick(shape, "color", "Color", "colour", "Colour", "rgba", "RGBA"))
     if not data or not color:
         return None
+    # A rotated rectangle is just a RECTANGLE that carries a rotation value.
+    final_type = ShapeType.RECTANGLE if type_id == ShapeType.ROTATED_RECTANGLE else type_id
     return {
-        "type": type_id,
+        "type": int(final_type),
         "data": data,
         "color": color,
         "score": _pick(shape, "score", "Score") or 0,
@@ -158,8 +176,17 @@ def _normalize_data(shape, type_id):
     except (TypeError, ValueError):
         return None
 
-    if type_id == ShapeType.RECTANGLE:
-        return [round(x), round(y), max(0.0, w), max(0.0, h)]
+    if type_id in (ShapeType.RECTANGLE, ShapeType.ROTATED_RECTANGLE):
+        # S1: carry rectangle rotation when present. Axis-aligned rects stay
+        # 4-value for backward compatibility (background detection, importer,
+        # preview fast path); only rotated rects gain the 5th value.
+        rot_norm = round(rot) % 360
+        base = [round(x), round(y), max(0.0, w), max(0.0, h)]
+        if rot_norm:
+            base.append(rot_norm)
+        return base
+    # TRIANGLE + ROTATED_ELLIPSE both carry [x, y, w, h, rot] (S3 triangle is a
+    # scaled/rotated stencil, the only form FH6 can write).
     return [round(x), round(y), max(1.0, w), max(1.0, h), round(rot) % 360]
 
 

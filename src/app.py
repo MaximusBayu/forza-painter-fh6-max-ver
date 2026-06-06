@@ -25,7 +25,7 @@ import psutil
 
 from app_paths import ROOT
 from game_profiles import PROFILES
-from geometry_json import RECTANGLE, ROTATED_ELLIPSE, load_normalized_geometry
+from geometry_json import RECTANGLE, TRIANGLE, ROTATED_ELLIPSE, load_normalized_geometry
 from generator_backend import GENERATOR_EXE, GENERATOR_JSON_SCAN_SECONDS, GENERATOR_POLL_SLEEP_SECONDS, GENERATOR_PREVIEW_SCAN_SECONDS, USER_SETTINGS_DIR, best_geometry_jsons, build_generator_command, build_generator_env, generated_jsons, generated_preview_files, generator_preview_path, load_settings, preprocess_input_image, write_custom_settings, write_user_settings_preset
 from version import APP_DISPLAY_NAME, __version__, app_title
 
@@ -292,6 +292,42 @@ def render_source_image(path, max_size=None):
         return None
 
 
+def _rotated_rect_corners(cx, cy, w, h, rot_deg, scale):
+    """Return 4 (x, y) corner points for a rotated rectangle, scaled.
+
+    Rotation convention matches geometry_optimize (R(theta)=[[cos,-sin],
+    [sin,cos]]) so previews and the offline optimizer agree. (In-game angle
+    behavior for square vinyls still needs a one-time fixture check, per S1.)
+    """
+    theta = math.radians(float(rot_deg))
+    ct, st = math.cos(theta), math.sin(theta)
+    hw, hh = float(w) / 2.0, float(h) / 2.0
+    pts = []
+    for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+        dx, dy = sx * hw, sy * hh
+        px = (float(cx) + dx * ct - dy * st) * scale
+        py = (float(cy) + dx * st + dy * ct) * scale
+        pts.append((px, py))
+    return pts
+
+
+def _triangle_corners(cx, cy, w, h, rot_deg, scale):
+    """Return 3 (x, y) corner points for an isoceles triangle stencil, scaled.
+
+    Apex up at local (0, -h/2); base corners at (-+w/2, +h/2). Same rotation
+    convention as _rotated_rect_corners / the optimizer triangle mask.
+    """
+    theta = math.radians(float(rot_deg))
+    ct, st = math.cos(theta), math.sin(theta)
+    hw, hh = float(w) / 2.0, float(h) / 2.0
+    pts = []
+    for dx, dy in ((0.0, -hh), (-hw, hh), (hw, hh)):
+        px = (float(cx) + dx * ct - dy * st) * scale
+        py = (float(cy) + dx * st + dy * ct) * scale
+        pts.append((px, py))
+    return pts
+
+
 def render_geometry_json(path, max_size=None):
     pillow_preview = render_geometry_json_pillow(path, max_size)
     if pillow_preview:
@@ -330,16 +366,26 @@ def render_geometry_json(path, max_size=None):
                 axes = (max(1, int(round(float(h) * scale))), max(1, int(round(float(w) * scale))))
                 preview = cv2.ellipse(preview, center, axes, -90 + float(rot_deg), 0.0, 360.0, (b, g, r), thickness=-1)
             elif shape_type == RECTANGLE:
-                x, y, w, h = shape["data"]
-                x = float(x)
-                y = float(y)
-                w = float(w)
-                h = float(h)
-                x0 = int(round((x - w / 2) * scale))
-                y0 = int(round((y - h / 2) * scale))
-                x1 = int(round((x + w / 2) * scale))
-                y1 = int(round((y + h / 2) * scale))
-                preview = cv2.rectangle(preview, (x0, y0), (x1, y1), (b, g, r), thickness=-1)
+                data = shape["data"]
+                x, y, w, h = (float(v) for v in data[:4])
+                rot_deg = float(data[4]) if len(data) >= 5 else 0.0
+                if rot_deg:
+                    pts = _rotated_rect_corners(x, y, w, h, rot_deg, scale)
+                    poly = np.array([[int(round(px)), int(round(py))] for px, py in pts], np.int32)
+                    preview = cv2.fillConvexPoly(preview, poly, (b, g, r))
+                else:
+                    x0 = int(round((x - w / 2) * scale))
+                    y0 = int(round((y - h / 2) * scale))
+                    x1 = int(round((x + w / 2) * scale))
+                    y1 = int(round((y + h / 2) * scale))
+                    preview = cv2.rectangle(preview, (x0, y0), (x1, y1), (b, g, r), thickness=-1)
+            elif shape_type == TRIANGLE:
+                data = shape["data"]
+                x, y, w, h = (float(v) for v in data[:4])
+                rot_deg = float(data[4]) if len(data) >= 5 else 0.0
+                pts = _triangle_corners(x, y, w, h, rot_deg, scale)
+                poly = np.array([[int(round(px)), int(round(py))] for px, py in pts], np.int32)
+                preview = cv2.fillConvexPoly(preview, poly, (b, g, r))
         return image_to_photo(preview, max_size)
     except Exception:
         return None
@@ -379,20 +425,48 @@ def render_geometry_json_pillow(path, max_size=None):
             r, g, b, _a = color
             shape_type = int(shape.get("type", 0))
             if shape_type == RECTANGLE:
-                x, y, w, h = [float(v) for v in shape["data"]]
-                x0 = int(round((x - w / 2) * render_scale))
-                y0 = int(round((y - h / 2) * render_scale))
-                x1 = int(round((x + w / 2) * render_scale))
-                y1 = int(round((y + h / 2) * render_scale))
-                draw.rectangle((x0, y0, x1, y1), fill=(r, g, b))
+                data = shape["data"]
+                x, y, w, h = [float(v) for v in data[:4]]
+                rot_deg = float(data[4]) if len(data) >= 5 else 0.0
+                if rot_deg:
+                    pts = _rotated_rect_corners(x, y, w, h, rot_deg, render_scale)
+                    draw.polygon([(int(round(px)), int(round(py))) for px, py in pts], fill=(r, g, b))
+                else:
+                    x0 = int(round((x - w / 2) * render_scale))
+                    y0 = int(round((y - h / 2) * render_scale))
+                    x1 = int(round((x + w / 2) * render_scale))
+                    y1 = int(round((y + h / 2) * render_scale))
+                    draw.rectangle((x0, y0, x1, y1), fill=(r, g, b))
             elif shape_type == ROTATED_ELLIPSE:
                 x, y, w, h, rot_deg = [float(v) for v in shape["data"]]
                 draw_preview_ellipse_pillow(preview, x, y, w, h, rot_deg, (r, g, b), render_scale)
+            elif shape_type == TRIANGLE:
+                data = shape["data"]
+                x, y, w, h = [float(v) for v in data[:4]]
+                rot_deg = float(data[4]) if len(data) >= 5 else 0.0
+                pts = _triangle_corners(x, y, w, h, rot_deg, render_scale)
+                draw.polygon([(int(round(px)), int(round(py))) for px, py in pts], fill=(r, g, b))
         if PREVIEW_JSON_SUPERSAMPLE > 1:
             preview = preview.resize((preview_w, preview_h), Image.Resampling.LANCZOS)
         return pil_to_photo(preview)
     except Exception:
         return None
+
+
+def _load_preview_numpy():
+    """Lazy-load numpy for the fast preview blit. None if numpy is unavailable.
+
+    numpy lives in requirements-preview.txt (optional), so the pure-Python
+    fallback below must keep working when it is missing.
+    """
+    if not hasattr(_load_preview_numpy, "_cache"):
+        try:
+            import numpy as _np  # noqa: PLC0415
+
+            _load_preview_numpy._cache = _np
+        except Exception:
+            _load_preview_numpy._cache = None
+    return _load_preview_numpy._cache
 
 
 def draw_preview_ellipse_pillow(image, x, y, w, h, rot_deg, color, scale):
@@ -416,8 +490,29 @@ def draw_preview_ellipse_pillow(image, x, y, w, h, rot_deg, color, scale):
     y_max = min(height - 1, int(math.ceil(cy + extent_y + 1)))
     if x_min > x_max or y_min > y_max:
         return
-    pixels = image.load()
     r, g, b = color
+
+    # Fast path: vectorize the exact same rotated-ellipse test with numpy over
+    # the shape's bbox, then blit the masked pixels back in one paste. Same math
+    # (xr^2/rx^2 + yr^2/ry^2 <= 1) -> pixel-identical to the loop below.
+    np = _load_preview_numpy()
+    if np is not None:
+        from PIL import Image  # noqa: PLC0415
+
+        region = np.array(image.crop((x_min, y_min, x_max + 1, y_max + 1)))
+        yy, xx = np.mgrid[y_min:y_max + 1, x_min:x_max + 1]
+        dx = (xx + 0.5) - cx
+        dy = (yy + 0.5) - cy
+        xr = dx * cos_t + dy * sin_t
+        yr = -dx * sin_t + dy * cos_t
+        mask = xr * xr * inv_rx2 + yr * yr * inv_ry2 <= 1.0
+        if mask.any():
+            region[mask] = (r, g, b)
+            image.paste(Image.fromarray(region, "RGB"), (x_min, y_min))
+        return
+
+    # Pure-Python fallback (no numpy installed).
+    pixels = image.load()
     for yy in range(y_min, y_max + 1):
         dy = (float(yy) + 0.5) - cy
         for xx in range(x_min, x_max + 1):
@@ -463,12 +558,16 @@ class App:
         self.custom_random_samples = StringVar()
         self.custom_mutated_samples = StringVar()
         self.custom_save_at = StringVar()
+        self.custom_max_threads = StringVar()
         self.custom_preprocess_mode = StringVar(value="none")
         self.translated = []
         self.detailed_log_lock = threading.Lock()
         self.detailed_log_lines = deque()
         self.detailed_log_chars = 0
         self.current_preview_request = None
+        # Phase 2: monotonically increasing id so a stale off-thread JSON
+        # render (superseded by a newer selection/resize) is dropped on arrival.
+        self._preview_request_id = 0
         self.preview_resize_job = None
         self.update_state = {"status": "checking"}
         self.update_dialog = None
@@ -887,6 +986,7 @@ class App:
             ("custom_random", self.custom_random_samples),
             ("custom_mutated", self.custom_mutated_samples),
             ("custom_save_at", self.custom_save_at),
+            ("custom_max_threads", self.custom_max_threads),
         ]
         for row_index, (key, variable) in enumerate(custom_specs):
             label = self._label(custom_grid, key, anchor="w")
@@ -895,7 +995,7 @@ class App:
             entry.grid(row=row_index, column=1, sticky="ew", pady=1)
             self.custom_fields.append(entry)
         custom_grid.columnconfigure(1, weight=1)
-        preprocess_widget = self._field(custom_grid, "preprocess_mode", self.custom_preprocess_mode, row=len(custom_specs), values=["none", "luma_band"], readonly=True)
+        preprocess_widget = self._field(custom_grid, "preprocess_mode", self.custom_preprocess_mode, row=len(custom_specs), values=["none", "luma_band", "edge_aware"], readonly=True)
         self.custom_fields.append(preprocess_widget)
         custom_actions = Frame(custom_section)
         custom_actions.pack(fill=X, padx=10, pady=(0, 8))
@@ -1070,6 +1170,7 @@ class App:
             self.custom_random_samples.set(values.get("randomSamples", "3000"))
             self.custom_mutated_samples.set(values.get("mutatedSamples", "1000"))
             self.custom_save_at.set(values.get("saveAt", values.get("stopAt", "3000")))
+            self.custom_max_threads.set(values.get("maxThreads", "0"))
             self.custom_preprocess_mode.set(values.get("preprocessMode", "none"))
 
     def _sync_custom_state(self):
@@ -1092,6 +1193,7 @@ class App:
             "randomSamples": self.custom_random_samples.get(),
             "mutatedSamples": self.custom_mutated_samples.get(),
             "saveAt": self.custom_save_at.get(),
+            "maxThreads": self.custom_max_threads.get(),
             "preprocessMode": self.custom_preprocess_mode.get(),
         }
         if not custom["saveAt"] and custom["stopAt"]:
@@ -1788,15 +1890,39 @@ class App:
         if not path.exists():
             return
         if kind == "json":
-            data = render_geometry_json(path, self._preview_bounds())
-        else:
-            data = render_source_image(path, self._preview_bounds())
+            # JSON geometry rasterization is the slow path; render off-thread.
+            self._render_json_preview_async(path)
+            return
+        data = render_source_image(path, self._preview_bounds())
         self.show_preview(data)
+
+    def _render_json_preview_async(self, path):
+        """Rasterize a geometry JSON on a daemon thread, post bytes to the queue.
+
+        render_geometry_json returns image bytes (no Tk objects), so only the
+        final PhotoImage creation must stay on the main thread (in show_preview,
+        reached via the 'preview_result' queue handler). A request id lets a
+        newer selection/resize supersede an in-flight render.
+        """
+        self._preview_request_id += 1
+        rid = self._preview_request_id
+        bounds = self._preview_bounds()
+        path = Path(path)
+
+        def worker():
+            try:
+                data = render_geometry_json(path, bounds)
+            except Exception:
+                data = None
+            if not self.closed:
+                self.queue.put(("preview_result", (rid, data)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def show_json_preview(self, path):
         path = Path(path)
         self.current_preview_request = ("json", path)
-        self.show_preview(render_geometry_json(path, self._preview_bounds()))
+        self._render_json_preview_async(path)
 
     def show_preview(self, data):
         if not data:
@@ -1820,6 +1946,7 @@ class App:
     def show_source_preview(self, path):
         path = Path(path)
         self.current_preview_request = ("source", path)
+        self._preview_request_id += 1  # supersede any in-flight JSON render
         data = render_source_image(path, self._preview_bounds())
         if data:
             self.show_preview(data)
@@ -1833,6 +1960,7 @@ class App:
         path = Path(path)
         if remember:
             self.current_preview_request = ("file", path)
+        self._preview_request_id += 1  # supersede any in-flight JSON render
         data = render_source_image(path, self._preview_bounds())
         if data:
             self.show_preview(data)
@@ -2429,6 +2557,10 @@ class App:
                     self.log_line(tr(self.lang, "generation_stopped"))
             elif kind == "preview":
                 self.show_preview(payload)
+            elif kind == "preview_result":
+                rid, data = payload
+                if not self.closed and rid == self._preview_request_id:
+                    self.show_preview(data)
             elif kind == "preview_json":
                 self.show_json_preview(payload)
             elif kind == "preview_file":

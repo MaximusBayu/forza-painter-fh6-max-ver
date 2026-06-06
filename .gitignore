@@ -14,9 +14,12 @@ webui-data/
 runtime/
 dist/
 build/
+.build/
+.toolchain/
 
 # Large/volatile FH6 diagnostics
 *count-*.json
 *memory-count-*.jsonl
 *candidates.json
 guided-memory-*.jsonl
+.claude/*

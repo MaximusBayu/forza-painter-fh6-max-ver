@@ -8,8 +8,15 @@ from pathlib import Path
 from utils import PreprocessError
 
 
-def luma_band(image_path: str | Path) -> Path:
+DEFAULT_LEVELS = 24.0
+
+
+def luma_band(image_path: str | Path, levels: float = DEFAULT_LEVELS) -> Path:
     """Apply luminance banding preprocessing and write result atomically.
+
+    ``levels`` controls how many luminance bands the image is quantized into
+    (improvement-plan Phase 5: surfaced as the ``lumaLevels`` setting). Lower =
+    fewer bands = fewer shapes to converge, but more visible banding.
 
     Returns the path to the preprocessed output file.
     """
@@ -18,7 +25,7 @@ def luma_band(image_path: str | Path) -> Path:
     if bgra is None:
         raise PreprocessError(f"failed to read image: {image_path}")
 
-    result = _apply_preprocess(bgra)
+    result = _apply_preprocess(bgra, levels)
     output_path = image_path.with_name(f"{image_path.stem}.luma_band{image_path.suffix}")
 
     # Atomic write: write to a temp file first, then rename.
@@ -44,7 +51,7 @@ def luma_band(image_path: str | Path) -> Path:
     return output_path
 
 
-def _apply_preprocess(bgra: np.ndarray) -> np.ndarray:
+def _apply_preprocess(bgra: np.ndarray, levels: float = DEFAULT_LEVELS) -> np.ndarray:
     if bgra.ndim != 3:
         raise PreprocessError(f"expected 3D image array, got shape {bgra.shape}")
 
@@ -52,6 +59,7 @@ def _apply_preprocess(bgra: np.ndarray) -> np.ndarray:
     if channels not in (3, 4):
         raise PreprocessError(f"expected 3 or 4 channels, got {channels}")
 
+    levels = float(max(2.0, min(255.0, levels)))
     bgr = np.clip(bgra[..., :3], 0, 255).astype(np.uint8)
     has_alpha = channels == 4
     if has_alpha:
@@ -60,7 +68,6 @@ def _apply_preprocess(bgra: np.ndarray) -> np.ndarray:
     # cv2.imread returns BGR, so we convert BGR->LAB, not RGB->LAB.
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     lum = lab[..., 0].astype(np.float32)
-    levels = 24.0  # TODO make this a setting
     step = 256.0 / levels
     lq = np.floor(lum / step) * step + step * 0.5
     # Keep the band separation, but blend some original luminance back in

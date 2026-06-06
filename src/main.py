@@ -18,7 +18,7 @@ import subprocess
 from native import *
 from internal_classes import *
 from game_profiles import iter_profiles, PROFILES
-from geometry_json import RECTANGLE, ROTATED_ELLIPSE, load_normalized_geometry
+from geometry_json import RECTANGLE, TRIANGLE, ROTATED_ELLIPSE, load_normalized_geometry
 import colorsys
 import os
 
@@ -27,6 +27,16 @@ from utils import load_cv2, parse_int
 FH6_DISCOVERED_TABLE_POINTER_DELTA = 0x1E
 FH6_CIRCLE_BASE_SIZE = 63.0
 FH6_RECTANGLE_BASE_SIZE = 127.0
+# S3 triangle: these two constants are the ONLY pieces that need in-game
+# discovery (Tools -> Inspect table on a placed triangle vinyl). The shape-id
+# byte is unknown until then; while it is None the importer safely SKIPS
+# triangles instead of writing a guessed byte into game memory. Override via
+# the FORZA_PAINTER_TRIANGLE_SHAPE_ID / _BASE_SIZE env vars once discovered.
+FH6_TRIANGLE_SHAPE_ID = parse_int(os.environ.get("FORZA_PAINTER_TRIANGLE_SHAPE_ID"))
+try:
+    FH6_TRIANGLE_BASE_SIZE = float(os.environ.get("FORZA_PAINTER_TRIANGLE_BASE_SIZE", FH6_RECTANGLE_BASE_SIZE))
+except (TypeError, ValueError):
+    FH6_TRIANGLE_BASE_SIZE = FH6_RECTANGLE_BASE_SIZE
 
 
 def is_admin():
@@ -153,7 +163,12 @@ def draw_memory_shape(pid: int, profile, shape: Shape, index: int, cLiveryLayerT
     pos_data = struct.pack('f', shape.x) + struct.pack('f', -shape.y)
     try:
         write_process_memory(pid, current_layer_address + profile.layer_position_offset, pos_data)
-        scale_divisor = FH6_CIRCLE_BASE_SIZE if shape.type_id == ROTATED_ELLIPSE else FH6_RECTANGLE_BASE_SIZE
+        if shape.type_id == ROTATED_ELLIPSE:
+            scale_divisor = FH6_CIRCLE_BASE_SIZE
+        elif shape.type_id == TRIANGLE:
+            scale_divisor = FH6_TRIANGLE_BASE_SIZE
+        else:
+            scale_divisor = FH6_RECTANGLE_BASE_SIZE
         scale_data = struct.pack('f', shape.w / scale_divisor) + struct.pack('f', shape.h / scale_divisor)
         write_process_memory(pid, current_layer_address + profile.layer_scale_offset, scale_data)
         rot_data = struct.pack('f', 360 - shape.rot_deg)
@@ -162,6 +177,9 @@ def draw_memory_shape(pid: int, profile, shape: Shape, index: int, cLiveryLayerT
         write_process_memory(pid, current_layer_address + profile.layer_color_offset, color_data)
         if shape.type_id == ROTATED_ELLIPSE:
             shape_id_data = struct.pack('B', 102)
+            write_process_memory(pid, current_layer_address + profile.layer_shape_id_offset, shape_id_data)
+        elif shape.type_id == TRIANGLE and FH6_TRIANGLE_SHAPE_ID is not None:
+            shape_id_data = struct.pack('B', int(FH6_TRIANGLE_SHAPE_ID) & 0xFF)
             write_process_memory(pid, current_layer_address + profile.layer_shape_id_offset, shape_id_data)
         elif shape.type_id == RECTANGLE:
             shape_id_data = struct.pack('B', 101)
@@ -196,6 +214,7 @@ def load_geometry(
     image_w, image_h = data['shapes'][0]['data'][2:]
     bg_r, bg_g, bg_b, bg_a = data['shapes'][0]['color']
     shapes = []
+    triangle_skipped = 0
     
     # If the exported geometry has a visible rectangle background, add it.
     # Transparent PNG exports often include an alpha=0 background rectangle;
@@ -213,11 +232,32 @@ def load_geometry(
             r,g,b,a = shape['color']
             shapes.append(Shape(shape['type'], x, y, w, h, rot_deg, Color(r,g,b,a), False))
         elif shape['type'] == RECTANGLE:
-            x,y,w,h = shape['data']
+            data = shape['data']
+            x, y, w, h = data[:4]
+            # S1: carry rectangle rotation (5th value) when present. The write
+            # path already stores a rotation field for every layer.
+            rot_deg = data[4] if len(data) >= 5 else 0
             r,g,b,a = shape['color']
-            shapes.append(Shape(shape['type'], x, y, w, h, 0, Color(r,g,b,a), False))
+            shapes.append(Shape(shape['type'], x, y, w, h, rot_deg, Color(r,g,b,a), False))
+        elif shape['type'] == TRIANGLE:
+            # S3: triangles only import once the FH6 shape-id byte is known.
+            # Until then skip them rather than write a guessed byte to memory.
+            if FH6_TRIANGLE_SHAPE_ID is None:
+                triangle_skipped += 1
+                continue
+            data = shape['data']
+            x, y, w, h = data[:4]
+            rot_deg = data[4] if len(data) >= 5 else 0
+            r,g,b,a = shape['color']
+            shapes.append(Shape(shape['type'], x, y, w, h, rot_deg, Color(r,g,b,a), False))
         else:
             print("Skipping unsupported shape type {}.".format(shape.get("type")))
+    if triangle_skipped:
+        print(
+            "Skipped {} triangle shape(s): the FH6 triangle shape-id is not configured. "
+            "Discover it in-game (Tools -> Inspect table) and set FORZA_PAINTER_TRIANGLE_SHAPE_ID."
+            .format(triangle_skipped)
+        )
     if len(shapes) == 0:
         print("No shapes were loaded. Check your exported geometry .json")
         return
@@ -236,11 +276,31 @@ def load_geometry(
             if shape.type_id == ROTATED_ELLIPSE:
                 preview = cv2.ellipse(preview, (shape.x, shape.y), (int(shape.h), int(shape.w)), -90 + shape.rot_deg, 0., 360, (shape.color.b, shape.color.g, shape.color.r), thickness=-1)
             elif shape.type_id == RECTANGLE:
-                x0 = int(round(shape.x - shape.w / 2))
-                y0 = int(round(shape.y - shape.h / 2))
-                x1 = int(round(shape.x + shape.w / 2))
-                y1 = int(round(shape.y + shape.h / 2))
-                preview = cv2.rectangle(preview, (x0, y0), (x1, y1), (shape.color.b, shape.color.g, shape.color.r), thickness=-1)
+                rot_deg = getattr(shape, "rot_deg", 0) or 0
+                if rot_deg:
+                    theta = np.deg2rad(float(rot_deg))
+                    ct, st = np.cos(theta), np.sin(theta)
+                    hw, hh = shape.w / 2.0, shape.h / 2.0
+                    corners = []
+                    for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                        dx, dy = sx * hw, sy * hh
+                        corners.append([shape.x + dx * ct - dy * st, shape.y + dx * st + dy * ct])
+                    pts = np.array(corners, dtype=np.int32)
+                    preview = cv2.fillConvexPoly(preview, pts, (shape.color.b, shape.color.g, shape.color.r))
+                else:
+                    x0 = int(round(shape.x - shape.w / 2))
+                    y0 = int(round(shape.y - shape.h / 2))
+                    x1 = int(round(shape.x + shape.w / 2))
+                    y1 = int(round(shape.y + shape.h / 2))
+                    preview = cv2.rectangle(preview, (x0, y0), (x1, y1), (shape.color.b, shape.color.g, shape.color.r), thickness=-1)
+            elif shape.type_id == TRIANGLE:
+                theta = np.deg2rad(float(getattr(shape, "rot_deg", 0) or 0))
+                ct, st = np.cos(theta), np.sin(theta)
+                hw, hh = shape.w / 2.0, shape.h / 2.0
+                corners = [[shape.x + dx * ct - dy * st, shape.y + dx * st + dy * ct]
+                           for dx, dy in ((0.0, -hh), (-hw, hh), (hw, hh))]
+                pts = np.array(corners, dtype=np.int32)
+                preview = cv2.fillConvexPoly(preview, pts, (shape.color.b, shape.color.g, shape.color.r))
 
         if preview_enabled:
             print("Here is a preview of your image, click it then press any key to start!")

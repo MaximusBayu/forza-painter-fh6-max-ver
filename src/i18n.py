@@ -26,6 +26,7 @@ TEXT = {
         "custom_random": "Random samples",
         "custom_mutated": "Mutated samples",
         "custom_save_at": "Save checkpoints",
+        "custom_max_threads": "Max threads (0=auto)",
         "preprocess_mode": "Preprocess mode",
         "save_custom_preset": "Save as preset",
         "custom_panel_title": "Custom settings",
