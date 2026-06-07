@@ -12,6 +12,7 @@ preview.png
 
 webui-data/
 runtime/
+generated/
 dist/
 build/
 .build/

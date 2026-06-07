@@ -19,14 +19,14 @@ import webbrowser
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Button, Canvas, Checkbutton, Entry, Frame, Label, Listbox, PhotoImage, StringVar, Text, Tk, Toplevel, filedialog, messagebox, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, X, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Listbox, PhotoImage, Radiobutton, StringVar, Text, Tk, Toplevel, filedialog, messagebox, ttk
 
 import psutil
 
 from app_paths import ROOT
 from game_profiles import PROFILES
 from geometry_json import RECTANGLE, TRIANGLE, ROTATED_ELLIPSE, load_normalized_geometry
-from generator_backend import GENERATOR_EXE, GENERATOR_JSON_SCAN_SECONDS, GENERATOR_POLL_SLEEP_SECONDS, GENERATOR_PREVIEW_SCAN_SECONDS, USER_SETTINGS_DIR, best_geometry_jsons, build_generator_command, build_generator_env, generated_jsons, generated_preview_files, generator_preview_path, load_settings, preprocess_input_image, write_custom_settings, write_user_settings_preset
+from generator_backend import DEFAULT_OUTPUT_DIR, GENERATOR_EXE, GENERATOR_JSON_SCAN_SECONDS, GENERATOR_POLL_SLEEP_SECONDS, GENERATOR_PREVIEW_SCAN_SECONDS, USER_SETTINGS_DIR, best_geometry_jsons, build_generator_command, build_generator_env, generated_jsons, generated_preview_files, generator_output_base, generator_preview_path, generator_stop_at, hybrid_base_path, load_settings, preprocess_input_image, set_output_dir, write_custom_settings, write_hybrid_settings, write_user_settings_preset
 from version import APP_DISPLAY_NAME, __version__, app_title
 
 
@@ -550,6 +550,13 @@ class App:
         self.images = [Path(path) for path in initial_images if Path(path).exists()]
         self.json_files = []
         self.outputs = []
+        self.output_dir = StringVar(value=str(DEFAULT_OUTPUT_DIR))
+        # Generate mode: geometrize (GPU greedy) | flat (R1 poster, CPU) |
+        # superpixel (R3 segments, CPU) | hybrid (flat base + geometrize residual).
+        self.gen_mode = StringVar(value="geometrize")
+        self.flat_colors = StringVar(value="24")
+        self.flat_segments = StringVar(value="400")
+        self.hybrid_detail = StringVar(value="500")
         self.processes = []
         self.photo = None
         self.use_custom_settings = StringVar(value="0")
@@ -559,6 +566,7 @@ class App:
         self.custom_mutated_samples = StringVar()
         self.custom_save_at = StringVar()
         self.custom_max_threads = StringVar()
+        self.custom_saliency = StringVar()
         self.custom_preprocess_mode = StringVar(value="none")
         self.translated = []
         self.detailed_log_lock = threading.Lock()
@@ -940,6 +948,32 @@ class App:
         self.image_list = Listbox(step1, height=3)
         self.image_list.pack(fill=X, padx=10, pady=(2, 8))
         self.image_list.bind("<<ListboxSelect>>", self._preview_selected_image)
+        out_row = Frame(step1)
+        out_row.pack(fill=X, padx=10, pady=(0, 8))
+        self._label(out_row, "output_dir").pack(side=LEFT)
+        self._button(out_row, "browse", self.choose_output_dir).pack(side=RIGHT)
+        Entry(out_row, textvariable=self.output_dir).pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
+
+        mode_row = Frame(step1)
+        mode_row.pack(fill=X, padx=10, pady=(0, 2))
+        self._label(mode_row, "gen_mode").pack(side=LEFT, padx=(0, 6))
+        for value, key in (
+            ("geometrize", "mode_geometrize"),
+            ("flat", "mode_flat"),
+            ("superpixel", "mode_superpixel"),
+            ("hybrid", "mode_hybrid"),
+        ):
+            rb = Radiobutton(mode_row, text=tr(self.lang, key), variable=self.gen_mode, value=value)
+            rb.pack(side=LEFT, padx=(4, 0))
+            self.translated.append((rb, key, "text"))
+        params_row = Frame(step1)
+        params_row.pack(fill=X, padx=10, pady=(0, 8))
+        self._label(params_row, "flat_colors").pack(side=LEFT)
+        Entry(params_row, textvariable=self.flat_colors, width=5).pack(side=LEFT, padx=(4, 12))
+        self._label(params_row, "flat_segments").pack(side=LEFT)
+        Entry(params_row, textvariable=self.flat_segments, width=6).pack(side=LEFT, padx=(4, 12))
+        self._label(params_row, "hybrid_detail").pack(side=LEFT)
+        Entry(params_row, textvariable=self.hybrid_detail, width=6).pack(side=LEFT, padx=(4, 0))
 
         step2 = ttk.LabelFrame(left, text=tr(self.lang, "generate_step_quality"))
         self.translated.append((step2, "generate_step_quality", "text"))
@@ -987,6 +1021,7 @@ class App:
             ("custom_mutated", self.custom_mutated_samples),
             ("custom_save_at", self.custom_save_at),
             ("custom_max_threads", self.custom_max_threads),
+            ("custom_saliency", self.custom_saliency),
         ]
         for row_index, (key, variable) in enumerate(custom_specs):
             label = self._label(custom_grid, key, anchor="w")
@@ -1061,6 +1096,7 @@ class App:
         self._label(row, "json_files").pack(side=LEFT)
         self._button(row, "add_json", self.add_json).pack(side=RIGHT)
         self._button(row, "remove_json", self.remove_selected_json).pack(side=RIGHT, padx=(8, 0))
+        self._button(row, "optimize_json", self.optimize_selected_json).pack(side=RIGHT, padx=8)
         self._button(row, "use_outputs", self.use_generated_outputs).pack(side=RIGHT, padx=8)
         self.json_list = Listbox(step3, height=10)
         self.json_list.pack(fill=BOTH, expand=True, padx=10, pady=6)
@@ -1171,6 +1207,7 @@ class App:
             self.custom_mutated_samples.set(values.get("mutatedSamples", "1000"))
             self.custom_save_at.set(values.get("saveAt", values.get("stopAt", "3000")))
             self.custom_max_threads.set(values.get("maxThreads", "0"))
+            self.custom_saliency.set(values.get("saliencyStrength", "0"))
             self.custom_preprocess_mode.set(values.get("preprocessMode", "none"))
 
     def _sync_custom_state(self):
@@ -1194,6 +1231,7 @@ class App:
             "mutatedSamples": self.custom_mutated_samples.get(),
             "saveAt": self.custom_save_at.get(),
             "maxThreads": self.custom_max_threads.get(),
+            "saliencyStrength": self.custom_saliency.get(),
             "preprocessMode": self.custom_preprocess_mode.get(),
         }
         if not custom["saveAt"] and custom["stopAt"]:
@@ -1837,6 +1875,53 @@ class App:
         self._render_lists()
         self.log_line(f"Added {len(self.outputs)} generated JSON file(s) to import list.")
 
+    def choose_output_dir(self):
+        initial = self.output_dir.get().strip() or str(DEFAULT_OUTPUT_DIR)
+        chosen = filedialog.askdirectory(initialdir=initial, title=tr(self.lang, "output_dir"))
+        if chosen:
+            applied = set_output_dir(chosen)
+            self.output_dir.set(str(applied))
+            self.log_line(f"Generated JSON will be written to: {applied}")
+
+    def optimize_selected_json(self):
+        """Run the offline optimizer (occlusion + dedupe prune) on the selected
+        JSON, then add the optimized result to the import list."""
+        selection = self.json_list.curselection()
+        if not selection:
+            self.log_line("Select a JSON in the list to optimize first.")
+            return
+        src = Path(self.json_files[selection[0]])
+        if not src.exists():
+            self.log_line(f"File not found: {src}")
+            return
+        self.status.set(tr(self.lang, "running"))
+        threading.Thread(target=lambda: self._optimize_worker(src), daemon=True).start()
+
+    def _optimize_worker(self, src):
+        try:
+            from geometry_optimize import optimize_geometry
+        except Exception as exc:
+            self.queue.put(("log", f"Optimizer unavailable (needs numpy): {exc}"))
+            self.queue.put(("status", tr(self.lang, "ready")))
+            return
+        try:
+            report = optimize_geometry(src)
+        except Exception as exc:
+            self.queue.put(("log", f"Optimize failed: {exc}"))
+            self.queue.put(("status", tr(self.lang, "ready")))
+            return
+        out = Path(report["output"])
+        if out.exists() and out not in self.json_files:
+            self.json_files.append(out)
+        self.queue.put((
+            "log",
+            "Optimized {}: {} -> {} layers (ssim {}). Added '{}' to import list.".format(
+                src.name, report["layers_in"], report["layers_out"], report["ssim"], out.name
+            ),
+        ))
+        self.queue.put(("render_lists", None))
+        self.queue.put(("status", tr(self.lang, "done")))
+
     def _preview_selected_image(self, _event=None):
         selection = self.image_list.curselection()
         if selection:
@@ -2054,11 +2139,14 @@ class App:
                 self.generation_running = False
             self.log_line("No quality profile selected.")
             return
-        if not GENERATOR_EXE.exists():
+        if self.gen_mode.get() in ("geometrize", "hybrid") and not GENERATOR_EXE.exists():
             with self.generation_lock:
                 self.generation_running = False
             self.log_line(f"Missing generator: {GENERATOR_EXE}")
             return
+        out_dir = set_output_dir(self.output_dir.get().strip())
+        self.output_dir.set(str(out_dir))
+        self.log_line(f"Generated JSON output directory: {out_dir}")
         self.shutdown_event.clear()
         self._reset_generation_eta()
         self.progress_text.set("")
@@ -2090,8 +2178,94 @@ class App:
                         pass
                 self.queue.put(("log", f"Generating: {image_path}"))
                 self.queue.put(("preview_file", image_path))
+
+                mode = self.gen_mode.get()
+
+                if mode in ("flat", "superpixel"):
+                    # CPU-only Python flattener, no exe. flat=R1 poster (color
+                    # regions); superpixel=R3 (color+space segments, one pass).
+                    import flatten  # lazy import (mirror _optimize_worker)
+                    out_json = generator_output_base(input_image).with_suffix(".json")
+                    if mode == "superpixel":
+                        try:
+                            segments = int(self.flat_segments.get())
+                        except (TypeError, ValueError):
+                            segments = flatten.DEFAULT_SEGMENTS
+                        self.queue.put(("log", f"Superpixel mode: {segments} segments (CPU, one pass)..."))
+                        report = flatten.flatten_image(
+                            input_image, out_json, method="superpixel", n_segments=segments,
+                            preview_path=generator_preview_path(input_image),
+                        )
+                    else:
+                        try:
+                            n_colors = int(self.flat_colors.get())
+                        except (TypeError, ValueError):
+                            n_colors = flatten.DEFAULT_COLORS
+                        self.queue.put(("log", f"Flat/Poster mode: {n_colors} colors (CPU)..."))
+                        report = flatten.flatten_image(
+                            input_image, out_json, n_colors=n_colors,
+                            preview_path=generator_preview_path(input_image),
+                        )
+                    if self.shutdown_event.is_set():
+                        self.queue.put(("status", tr(self.lang, "stopped")))
+                        return
+                    self.queue.put(("log",
+                        f"{mode.capitalize()} done: {report['layers']} shapes, "
+                        f"{report['colors']} colors, {report['seconds']}s"))
+                    preview_files = generated_preview_files(input_image)
+                    if preview_files:
+                        self.queue.put(("preview_file", preview_files[0]))
+                    self._queue_generated_outputs(input_image, before)
+                    self.queue.put(("render_lists", None))
+                    continue
+
+                resume_path = None
+                settings_override = None
+                if mode == "hybrid":
+                    # Hybrid (R2): build an ellipse-only flat base, seed the
+                    # generator via -resume, and LOWER the total budget to
+                    # base+detail (via a temp settings .ini) so geometrize only
+                    # spends shapes on the residual -> faster end-to-end, not
+                    # just reseeded. Base must be ellipse-only (the engine's
+                    # checkpoint restore drops rectangles).
+                    import flatten  # lazy import (mirror _optimize_worker)
+                    try:
+                        n_colors = int(self.flat_colors.get())
+                    except (TypeError, ValueError):
+                        n_colors = flatten.DEFAULT_COLORS
+                    try:
+                        detail = max(1, int(self.hybrid_detail.get()))
+                    except (TypeError, ValueError):
+                        detail = 500
+                    base_json = hybrid_base_path(input_image)
+                    self.queue.put(("log", f"Hybrid: building flat base ({n_colors} colors, ellipse-only)..."))
+                    base_report = flatten.flatten_image(
+                        input_image, base_json, n_colors=n_colors, use_rects=False,
+                    )
+                    base_layers = base_report["layers"]
+                    if base_layers < 1:
+                        self.queue.put(("log", "Hybrid aborted: flat base produced no shapes."))
+                        self.queue.put(("status", tr(self.lang, "failed")))
+                        return
+                    total_stop = base_layers + detail
+                    settings_override = write_hybrid_settings(setting, total_stop)
+                    resume_path = base_json
+                    self.queue.put(("log",
+                        f"Hybrid base: {base_layers} ellipses; geometrize will add "
+                        f"{detail} detail shapes (stopAt={total_stop})."))
+                    if self.shutdown_event.is_set():
+                        self.queue.put(("status", tr(self.lang, "stopped")))
+                        return
+
                 flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                 cmd = build_generator_command(input_image, setting)
+                if settings_override is not None:
+                    for token_index, token in enumerate(cmd):
+                        if token == "-settings" and token_index + 1 < len(cmd):
+                            cmd[token_index + 1] = str(settings_override)
+                            break
+                if resume_path is not None:
+                    cmd += ["-resume", str(resume_path)]
                 self._record_detail(f"GENERATOR COMMAND: {self._format_command(cmd)}")
                 self.queue.put(("log", f"Running GPU generator with {setting['path'].name}"))
                 if self.shutdown_event.is_set():

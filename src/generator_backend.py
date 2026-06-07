@@ -18,9 +18,43 @@ from utils import PreprocessError
 BUNDLED_SETTINGS_DIR = RESOURCE_ROOT / "config" / "settings"
 USER_SETTINGS_DIR = ROOT / "config" / "settings"
 SETTINGS_DIR = BUNDLED_SETTINGS_DIR
-GENERATOR_EXE = RESOURCE_ROOT / "bin" / "forza-painter-geometrize-go.exe"
+# The generator binary can be overridden (e.g. to point at the forked
+# saliency-capable build) via FORZA_PAINTER_GENERATOR_EXE.
+_GENERATOR_EXE_OVERRIDE = os.environ.get("FORZA_PAINTER_GENERATOR_EXE")
+GENERATOR_EXE = (
+    Path(_GENERATOR_EXE_OVERRIDE)
+    if _GENERATOR_EXE_OVERRIDE
+    else RESOURCE_ROOT / "bin" / "forza-painter-geometrize-go.exe"
+)
 PREVIEW_DIR = ROOT / "runtime" / "previews"
 CUSTOM_SETTINGS_DIR = ROOT / "runtime" / "custom-settings"
+
+# Where generated geometry JSON is written. Default is a dedicated "generated"
+# folder beside the app (not next to the source image, which used to dump JSON
+# into e.g. Downloads). Overridable at runtime via set_output_dir() — wired to
+# the GUI output-directory picker.
+DEFAULT_OUTPUT_DIR = ROOT / "generated"
+_output_dir = DEFAULT_OUTPUT_DIR
+
+
+def set_output_dir(path) -> Path:
+    """Set the directory generated JSON is written to. Empty/None resets to the
+    default. Returns the resolved directory (created if missing)."""
+    global _output_dir
+    _output_dir = Path(path) if path else DEFAULT_OUTPUT_DIR
+    try:
+        _output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return _output_dir
+
+
+def get_output_dir() -> Path:
+    try:
+        _output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return _output_dir
 
 GENERATOR_PREVIEW_SCAN_SECONDS = 0.5
 GENERATOR_JSON_SCAN_SECONDS = 2.0
@@ -49,6 +83,7 @@ SETTING_KEYS: tuple[str, ...] = (
     "preprocessMode",
     "lumaLevels",
     "edgeAwareStrength",
+    "saliencyStrength",
     "saveAt",
     "saveEvery",
     "stopAt",
@@ -444,7 +479,7 @@ def generated_preview_files(image_path: str | Path) -> list[Path]:
 
 def generator_output_base(image_path: str | Path) -> Path:
     image_path = Path(image_path)
-    return image_path.with_name(_name_without_suffix(image_path))
+    return get_output_dir() / _name_without_suffix(image_path)
 
 
 def _name_without_suffix(path: Path) -> str:
@@ -469,3 +504,66 @@ def build_generator_command(
         "-preview",
         str(generator_preview_path(image_path)),
     ]
+
+
+# Where Hybrid mode writes the ellipse-only flat base it feeds to the generator
+# via -resume. Kept OUT of the output dir so it is not mistaken for a final
+# generated result by generated_jsons() discovery.
+HYBRID_BASE_DIR = ROOT / "runtime" / "hybrid-base"
+
+
+def generator_stop_at(setting_path: str | Path, default: int = 0) -> int:
+    """Read the ``stopAt`` shape budget from a generator settings .ini.
+
+    Returns ``default`` when the file is unreadable or the key is absent.
+    Used by Hybrid mode to verify the flat base has fewer ellipses than the
+    generator's budget (the engine rejects a checkpoint with >= stopAt shapes).
+    """
+    try:
+        text = Path(setting_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    match = re.search(r"(?mi)^\s*stopAt\s*=\s*(\d+)", text)
+    if not match:
+        return default
+    return int(match.group(1))
+
+
+def hybrid_base_path(image_path: str | Path) -> Path:
+    """Path for the ellipse-only flat base JSON fed to -resume in Hybrid mode."""
+    stem = Path(image_path).stem
+    return HYBRID_BASE_DIR / f"{stem}.flatbase.json"
+
+
+def write_hybrid_settings(base_setting: SettingProfile, stop_at: int) -> Path:
+    """Write a copy of a profile .ini with ``stopAt`` (and ``saveAt``) overridden.
+
+    Hybrid mode lowers the total shape budget to ``base_count + detail`` so the
+    generator only spends shapes on the residual instead of running the
+    profile's full ``stopAt``. All other keys are preserved by editing the
+    original .ini text in place. Returns the new settings path.
+    """
+    CUSTOM_SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = CUSTOM_SETTINGS_DIR / "hybrid.ini"
+    try:
+        text = Path(base_setting.path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    lines = text.splitlines()
+    seen_stop = seen_save = False
+    new_lines = []
+    for line in lines:
+        if re.match(r"(?i)^\s*stopAt\s*=", line):
+            new_lines.append(f"stopAt = {stop_at}")
+            seen_stop = True
+        elif re.match(r"(?i)^\s*saveAt\s*=", line):
+            new_lines.append(f"saveAt = {stop_at}")
+            seen_save = True
+        else:
+            new_lines.append(line)
+    if not seen_stop:
+        new_lines.append(f"stopAt = {stop_at}")
+    if not seen_save:
+        new_lines.append(f"saveAt = {stop_at}")
+    out_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return out_path
