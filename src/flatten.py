@@ -226,6 +226,8 @@ def _ellipse_candidate(contour):
     (cx, cy), (d1, d2), ang = cv2.fitEllipse(contour)
     if d1 <= 0 or d2 <= 0:
         return None
+    if not all(np.isfinite(v) for v in (cx, cy, d1, d2, ang)):
+        return None  # fitEllipse yields NaN on degenerate (collinear) contours
     w_semi = d2 / 2.0
     h_semi = d1 / 2.0
     rot = round(ang + 90.0) % 360

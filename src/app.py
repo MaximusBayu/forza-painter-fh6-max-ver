@@ -557,6 +557,8 @@ class App:
         self.flat_colors = StringVar(value="24")
         self.flat_segments = StringVar(value="400")
         self.hybrid_detail = StringVar(value="500")
+        self.refine_shapes = StringVar(value="1500")
+        self.ultra_shapes = StringVar(value="3000")
         self.processes = []
         self.photo = None
         self.use_custom_settings = StringVar(value="0")
@@ -961,6 +963,8 @@ class App:
             ("geometrize", "mode_geometrize"),
             ("flat", "mode_flat"),
             ("superpixel", "mode_superpixel"),
+            ("refine", "mode_refine"),
+            ("ultra", "mode_ultra"),
             ("hybrid", "mode_hybrid"),
         ):
             rb = Radiobutton(mode_row, text=tr(self.lang, key), variable=self.gen_mode, value=value)
@@ -973,7 +977,11 @@ class App:
         self._label(params_row, "flat_segments").pack(side=LEFT)
         Entry(params_row, textvariable=self.flat_segments, width=6).pack(side=LEFT, padx=(4, 12))
         self._label(params_row, "hybrid_detail").pack(side=LEFT)
-        Entry(params_row, textvariable=self.hybrid_detail, width=6).pack(side=LEFT, padx=(4, 0))
+        Entry(params_row, textvariable=self.hybrid_detail, width=6).pack(side=LEFT, padx=(4, 12))
+        self._label(params_row, "refine_shapes").pack(side=LEFT)
+        Entry(params_row, textvariable=self.refine_shapes, width=6).pack(side=LEFT, padx=(4, 12))
+        self._label(params_row, "ultra_shapes").pack(side=LEFT)
+        Entry(params_row, textvariable=self.ultra_shapes, width=6).pack(side=LEFT, padx=(4, 0))
 
         step2 = ttk.LabelFrame(left, text=tr(self.lang, "generate_step_quality"))
         self.translated.append((step2, "generate_step_quality", "text"))
@@ -2181,12 +2189,38 @@ class App:
 
                 mode = self.gen_mode.get()
 
-                if mode in ("flat", "superpixel"):
-                    # CPU-only Python flattener, no exe. flat=R1 poster (color
-                    # regions); superpixel=R3 (color+space segments, one pass).
+                if mode in ("flat", "superpixel", "refine", "ultra"):
+                    # CPU-only Python generators, no exe. flat=R1 poster (color
+                    # regions); superpixel=R3 (color+space segments, one pass);
+                    # refine=R7 residual pyramid (full-image high fidelity);
+                    # ultra=R8 multi-resolution ladder (beats geometrize).
                     import flatten  # lazy import (mirror _optimize_worker)
                     out_json = generator_output_base(input_image).with_suffix(".json")
-                    if mode == "superpixel":
+                    if mode == "ultra":
+                        import ultra  # lazy import (mirror _optimize_worker)
+                        try:
+                            shapes_budget = max(1, int(self.ultra_shapes.get()))
+                        except (TypeError, ValueError):
+                            shapes_budget = ultra.DEFAULT_SHAPES
+                        self.queue.put(("log",
+                            f"Ultra mode: {shapes_budget} shapes (CPU, multi-res ladder; ~20-30s)..."))
+                        report = ultra.ultra_image(
+                            input_image, out_json, max_shapes=shapes_budget,
+                            preview_path=generator_preview_path(input_image),
+                            progress=lambda msg: self.queue.put(("log", msg)),
+                        )
+                    elif mode == "refine":
+                        import refine  # lazy import (mirror _optimize_worker)
+                        try:
+                            shapes_budget = max(1, int(self.refine_shapes.get()))
+                        except (TypeError, ValueError):
+                            shapes_budget = refine.DEFAULT_SHAPES
+                        self.queue.put(("log", f"Refine mode: {shapes_budget} shape budget (CPU, residual pyramid)..."))
+                        report = refine.refine_image(
+                            input_image, out_json, max_shapes=shapes_budget,
+                            preview_path=generator_preview_path(input_image),
+                        )
+                    elif mode == "superpixel":
                         try:
                             segments = int(self.flat_segments.get())
                         except (TypeError, ValueError):
