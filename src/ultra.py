@@ -55,6 +55,12 @@ from refine import (
 
 DEFAULT_SHAPES = 3000        # = the game's drawable-layer cap (main.py:373)
 DEFAULT_MAX_RESOLUTION = 1400
+# FH6 import trims to min(template_count, 3000) drawable layers (main.py:373),
+# keeping the FIRST ones. Shapes are emitted in painter's order (structure ->
+# detail -> polish last), so requesting more than this only changes the preview
+# — the extra, finest-detail layers are dropped on import and the in-game livery
+# will not match the preview.
+GAME_LAYER_CAP = 3000
 
 # Per-level pass schedules: list of (blur_sigma, delta, min_area) tuples plus a
 # repeated final pass. Lower levels chase structure; the top level chases edge
@@ -174,6 +180,13 @@ def ultra_image(image_path, out_json_path, max_shapes: int = DEFAULT_SHAPES,
     image_path = Path(image_path)
     out_json_path = Path(out_json_path)
     max_shapes = max(1, int(max_shapes))
+    if progress is not None and max_shapes > GAME_LAYER_CAP:
+        progress(
+            f"Warning: FH6 imports at most {GAME_LAYER_CAP} layers and trims the "
+            f"rest (main.py:373) — the trimmed layers are the finest detail, so "
+            f"the in-game result will not match the preview. {max_shapes} "
+            f"requested; values above {GAME_LAYER_CAP} only help the preview. "
+            f"Use <= {GAME_LAYER_CAP}.")
 
     levels = []
     for divisor in (4, 2, 1):
@@ -254,7 +267,10 @@ def ultra_image(image_path, out_json_path, max_shapes: int = DEFAULT_SHAPES,
         "output": str(out_json_path),
         "layers": len(shapes),
         "base_layers": base_layers,
-        "colors": int(palette.shape[0]),
+        # distinct fill colors actually emitted (NOT the base posterize count —
+        # every residual/polish shape derives its own color), so the GUI log
+        # reflects the livery's real palette.
+        "colors": len({tuple(int(c) for c in s["color"][:3]) for s in shapes}),
         "seconds": round(time.perf_counter() - started, 3),
         "resolution": levels[-1],
     }

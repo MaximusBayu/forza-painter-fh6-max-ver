@@ -559,6 +559,8 @@ class App:
         self.hybrid_detail = StringVar(value="500")
         self.refine_shapes = StringVar(value="1500")
         self.ultra_shapes = StringVar(value="3000")
+        self.r5_iters = StringVar(value="150")
+        self.r5_opt_res = StringVar(value="384")
         self.processes = []
         self.photo = None
         self.use_custom_settings = StringVar(value="0")
@@ -965,6 +967,7 @@ class App:
             ("superpixel", "mode_superpixel"),
             ("refine", "mode_refine"),
             ("ultra", "mode_ultra"),
+            ("ultra-diff", "mode_ultra_diff"),
             ("hybrid", "mode_hybrid"),
         ):
             rb = Radiobutton(mode_row, text=tr(self.lang, key), variable=self.gen_mode, value=value)
@@ -981,7 +984,11 @@ class App:
         self._label(params_row, "refine_shapes").pack(side=LEFT)
         Entry(params_row, textvariable=self.refine_shapes, width=6).pack(side=LEFT, padx=(4, 12))
         self._label(params_row, "ultra_shapes").pack(side=LEFT)
-        Entry(params_row, textvariable=self.ultra_shapes, width=6).pack(side=LEFT, padx=(4, 0))
+        Entry(params_row, textvariable=self.ultra_shapes, width=6).pack(side=LEFT, padx=(4, 12))
+        self._label(params_row, "r5_iters").pack(side=LEFT)
+        Entry(params_row, textvariable=self.r5_iters, width=5).pack(side=LEFT, padx=(4, 12))
+        self._label(params_row, "r5_res").pack(side=LEFT)
+        Entry(params_row, textvariable=self.r5_opt_res, width=5).pack(side=LEFT, padx=(4, 0))
 
         step2 = ttk.LabelFrame(left, text=tr(self.lang, "generate_step_quality"))
         self.translated.append((step2, "generate_step_quality", "text"))
@@ -2189,7 +2196,7 @@ class App:
 
                 mode = self.gen_mode.get()
 
-                if mode in ("flat", "superpixel", "refine", "ultra"):
+                if mode in ("flat", "superpixel", "refine", "ultra", "ultra-diff"):
                     # CPU-only Python generators, no exe. flat=R1 poster (color
                     # regions); superpixel=R3 (color+space segments, one pass);
                     # refine=R7 residual pyramid (full-image high fidelity);
@@ -2207,6 +2214,34 @@ class App:
                         report = ultra.ultra_image(
                             input_image, out_json, max_shapes=shapes_budget,
                             preview_path=generator_preview_path(input_image),
+                            progress=lambda msg: self.queue.put(("log", msg)),
+                        )
+                    elif mode == "ultra-diff":
+                        import geometry_diff  # lazy import (mirror _optimize_worker)
+                        if geometry_diff.load_torch() is None:
+                            self.queue.put(("log",
+                                "Ultra+Diff (R5) needs PyTorch with CUDA. Install torch "
+                                "(pip install torch) or use Ultra (CPU) instead."))
+                            raise RuntimeError("PyTorch not installed for Ultra+Diff")
+                        try:
+                            warm_budget = max(1, int(self.ultra_shapes.get()))
+                        except (TypeError, ValueError):
+                            warm_budget = geometry_diff.DIFF_GAME_LAYER_CAP
+                        try:
+                            r5_iters = max(1, int(self.r5_iters.get()))
+                        except (TypeError, ValueError):
+                            r5_iters = geometry_diff.DIFF_DEFAULT_ITERS
+                        try:
+                            r5_res = max(64, int(self.r5_opt_res.get()))
+                        except (TypeError, ValueError):
+                            r5_res = geometry_diff.DIFF_DEFAULT_OPT_RES
+                        dev = "GPU" if geometry_diff.load_torch().cuda.is_available() else "CPU (slow)"
+                        self.queue.put(("log",
+                            f"Ultra+Diff (R5): warm {warm_budget} shapes + {r5_iters} refine "
+                            f"iters @ {r5_res}px on {dev}. Lower R5 res if out of GPU memory."))
+                        report = geometry_diff.diff_refine_image(
+                            input_image, out_json, warm_shapes=warm_budget, iters=r5_iters,
+                            opt_res=r5_res, preview_path=generator_preview_path(input_image),
                             progress=lambda msg: self.queue.put(("log", msg)),
                         )
                     elif mode == "refine":

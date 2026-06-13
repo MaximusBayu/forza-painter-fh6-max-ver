@@ -69,6 +69,23 @@ BASE_MAX_SHAPES = 200       # absolute base cap; the rest is residual budget
 BASE_MIN_AREA = 64          # base keeps only genuinely large regions
 MIN_GAIN = 1.0              # absolute SSE improvement a shape must deliver
 
+# Anti-artifact regularization (refine + ultra). Two streak sources, both
+# gated inside ``_evaluate`` so the caps apply to the deterministic fit AND
+# every hill-climb trial; see ``.claude/PRPs/notes/ultra-method.md``:
+#   * sampling — a ragged/disjoint error blob fitted by one minAreaRect /
+#       fitEllipse becomes a sliver spanning the gaps; the worst case is a
+#       near-zero-axis degenerate shape (aspect in the millions).
+#   * mutation — the hill-climb stretches a shape along one axis chasing
+#       bbox-local SSE, growing it into a streak.
+# A blanket aspect cap also kills *legit* thin features (hair, line art), so
+# elongation is judged by COHERENCE, not ratio alone: a long shape is kept
+# only if most pixels it covers match its single fill color.
+MIN_THICKNESS = 1.5     # reject fits whose short axis is sub-pixel thin
+MAX_ASPECT = 16.0       # above this long/short ratio a shape is a streak risk
+MIN_COHERENCE = 0.55    # ...and is kept only if >= this fraction of covered
+COH_DELTA = 22.0        # pixels match its fill within 3*COH_DELTA^2 SSE
+CLIMB_GROWTH = 2.0      # hill-climb may not grow an axis past this x its seed
+
 # Oversized error blobs are re-thresholded at their own error percentile and
 # recursed into, so one merged blob still yields many well-placed shapes.
 SPLIT_PERCENTILE = 70.0
@@ -126,8 +143,19 @@ def _evaluate(target: np.ndarray, canvas: np.ndarray, opaque_mask: np.ndarray,
     Returns ``(gain, color)`` where ``color`` is the L2-optimal fill at the
     given ``alpha`` (solid: mean target color; translucent: the color whose
     blend over the current canvas best matches the target), or ``None`` if
-    the shape covers no opaque pixels. ``gain`` may be negative.
+    the shape covers no opaque pixels, is sub-pixel thin, or is an incoherent
+    gap-spanning streak (see the anti-artifact gates). ``gain`` may be
+    negative.
     """
+    # Anti-artifact gate 1 (geometry, cheap — runs on every hill-climb trial):
+    # a sub-pixel-thin axis is a degenerate ~zero-area fit (e.g. fitEllipse on
+    # a near-collinear error ridge returns a 0.0007-px semi-axis) that wastes a
+    # layer and renders as a stray 1-px line. Reject before touching pixels.
+    da, db = abs(float(shape["data"][2])), abs(float(shape["data"][3]))
+    short, long_ = (da, db) if da <= db else (db, da)
+    if short < MIN_THICKNESS:
+        return None
+
     h, w = target.shape[:2]
     x0, y0, x1, y1 = _shape_bbox(shape, w, h, 1.0)
     mask = _shape_mask(shape, x0, y0, x1, y1, 1.0)
@@ -141,13 +169,24 @@ def _evaluate(target: np.ndarray, canvas: np.ndarray, opaque_mask: np.ndarray,
     sse_old = float(((t - c) ** 2).sum())
     if alpha >= 1.0:
         color = t.mean(axis=0)
-        sse_new = float(((t - color) ** 2).sum())
+        resid = ((t - color) ** 2).sum(axis=1)
     else:
         # Minimize ||t - ((1-a)c + a*color)||^2 -> color = mean((t-(1-a)c)/a).
         color = ((t - (1.0 - alpha) * c) / alpha).mean(axis=0)
         color = np.clip(color, 0.0, 255.0)
         blended = (1.0 - alpha) * c + alpha * color
-        sse_new = float(((t - blended) ** 2).sum())
+        resid = ((t - blended) ** 2).sum(axis=1)
+    sse_new = float(resid.sum())
+
+    # Anti-artifact gate 2 (coherence): an elongated shape is legit only if it
+    # traces a genuinely thin image feature (hair, line art, an edge), where
+    # nearly every pixel it covers matches its single fill color. A streak that
+    # bridges the gap between two unrelated patches covers a band of mismatched
+    # pixels, so its matched fraction is low. Low-aspect shapes skip the test.
+    if long_ > MAX_ASPECT * max(short, 1e-3):
+        coherent = float((resid < 3.0 * COH_DELTA * COH_DELTA).mean())
+        if coherent < MIN_COHERENCE:
+            return None
     return sse_old - sse_new, np.round(color)
 
 
@@ -169,6 +208,11 @@ def _hill_climb(target, canvas, opaque_mask, shape, start_gain, start_color,
     best_gain, best_color = start_gain, start_color
     data = list(shape["data"])
     n = len(data)
+    # Growth clamp (the "mutation" streak source): the seed already covers the
+    # feature, so the climb may slide/shrink/rotate it but must not stretch an
+    # axis into a streak. Cap each axis at CLIMB_GROWTH x its seed size.
+    max_w = CLIMB_GROWTH * max(abs(float(data[2])), MIN_THICKNESS)
+    max_h = CLIMB_GROWTH * max(abs(float(data[3])), MIN_THICKNESS)
     size = max(2.0, float(data[2]), float(data[3]))
     step = max(1.0, size * 0.15)
     rot_step = 6.0
@@ -183,6 +227,10 @@ def _hill_climb(target, canvas, opaque_mask, shape, start_gain, start_color,
                 trial = list(data)
                 trial[idx] = trial[idx] + delta
                 if idx in (2, 3) and trial[idx] < 0.5:
+                    continue
+                if idx == 2 and abs(trial[2]) > max_w:
+                    continue
+                if idx == 3 and abs(trial[3]) > max_h:
                     continue
                 scored = _evaluate(target, canvas, opaque_mask,
                                    {**shape, "data": trial}, alpha)
@@ -467,7 +515,8 @@ def refine_image(image_path, out_json_path, max_shapes: int = DEFAULT_SHAPES,
         "output": str(out_json_path),
         "layers": len(shapes),
         "base_layers": len(drawables),
-        "colors": int(palette.shape[0]),
+        # distinct fill colors actually emitted (not the base posterize count).
+        "colors": len({tuple(int(c) for c in s["color"][:3]) for s in shapes}),
         "seconds": round(time.perf_counter() - started, 3),
     }
 

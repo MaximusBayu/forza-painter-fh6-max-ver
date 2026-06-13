@@ -11,6 +11,7 @@ import refine
 from refine import (
     _error_map,
     _evaluate,
+    _hill_climb,
     _paint,
     _residual_pass,
     _refit_colors,
@@ -83,6 +84,72 @@ class TestEvaluate:
         shape = {"type": int(RECTANGLE), "data": [20, 20, 20.0, 20.0],
                  "color": [0, 0, 0, 255], "score": 0}
         assert _evaluate(target, canvas, opaque, shape) is None
+
+
+class TestSliverGate:
+    """Anti-artifact gates in _evaluate / _hill_climb (the streak fix)."""
+
+    def test_rejects_subpixel_thin_shape(self):
+        # A sub-pixel-thin axis is a degenerate ~zero-area fit; reject it even
+        # over a perfectly-matching region (it would otherwise score well).
+        target = np.full((40, 40, 3), 200.0, np.float32)
+        canvas = np.zeros_like(target)
+        opaque = np.ones((40, 40), bool)
+        thin = {"type": int(RECTANGLE), "data": [20, 20, 30.0, 0.5],
+                "color": [0, 0, 0, 255], "score": 0}
+        assert _evaluate(target, canvas, opaque, thin) is None
+
+    def test_keeps_coherent_thin_feature(self):
+        # A high-aspect shape over a uniformly-matching band is a real thin
+        # feature (hair/line) — coherence is high, so it must be accepted.
+        target = np.full((40, 40, 3), 200.0, np.float32)
+        canvas = np.zeros_like(target)
+        opaque = np.ones((40, 40), bool)
+        streak = {"type": int(RECTANGLE), "data": [20, 20, 38.0, 2.0],
+                  "color": [0, 0, 0, 255], "score": 0}
+        assert (38.0 / 2.0) > refine.MAX_ASPECT  # in the gated regime
+        scored = _evaluate(target, canvas, opaque, streak)
+        assert scored is not None and scored[0] > 0
+
+    def test_rejects_incoherent_streak(self):
+        # Same aspect, but the band bridges two mismatched colors: one fill
+        # color cannot match both, so coherence is low -> rejected.
+        target = np.zeros((40, 40, 3), np.float32)
+        target[:, :20] = (250.0, 0.0, 0.0)
+        target[:, 20:] = (0.0, 0.0, 250.0)
+        canvas = np.zeros_like(target)
+        opaque = np.ones((40, 40), bool)
+        streak = {"type": int(RECTANGLE), "data": [20, 20, 38.0, 2.0],
+                  "color": [0, 0, 0, 255], "score": 0}
+        assert _evaluate(target, canvas, opaque, streak) is None
+
+    def test_low_aspect_bypasses_coherence(self):
+        # Only elongated shapes pay the coherence test; a compact shape over
+        # the same mismatched colors is accepted normally.
+        target = np.zeros((40, 40, 3), np.float32)
+        target[:, :20] = (250.0, 0.0, 0.0)
+        target[:, 20:] = (0.0, 0.0, 250.0)
+        canvas = np.zeros_like(target)
+        opaque = np.ones((40, 40), bool)
+        square = {"type": int(RECTANGLE), "data": [20, 20, 36.0, 36.0],
+                  "color": [0, 0, 0, 255], "score": 0}
+        scored = _evaluate(target, canvas, opaque, square)
+        assert scored is not None and scored[0] > 0
+
+    def test_hill_climb_clamps_growth(self):
+        # On a uniform bright target the climb would grow the shape without
+        # bound; the clamp caps each axis at CLIMB_GROWTH x the seed size.
+        target = np.full((48, 48, 3), 200.0, np.float32)
+        canvas = np.zeros_like(target)
+        opaque = np.ones((48, 48), bool)
+        seed_w = seed_h = 4.0
+        seed = {"type": int(RECTANGLE), "data": [24.0, 24.0, seed_w, seed_h],
+                "color": [0, 0, 0, 255], "score": 0}
+        start = _evaluate(target, canvas, opaque, seed)
+        assert start is not None
+        _hill_climb(target, canvas, opaque, seed, start[0], start[1], 1.0, 120)
+        assert abs(seed["data"][2]) <= refine.CLIMB_GROWTH * seed_w + 1e-6
+        assert abs(seed["data"][3]) <= refine.CLIMB_GROWTH * seed_h + 1e-6
 
 
 # ---------------------------------------------------------------------------
