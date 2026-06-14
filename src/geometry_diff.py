@@ -419,6 +419,35 @@ def _sobel(torch, img):
     return gx, gy
 
 
+def _ssim_loss(torch, x, y, win=11, sigma=1.5):
+    """Differentiable ``1 - SSIM`` between two (H, W, 3) images in 0..1.
+
+    Windowed (Gaussian) SSIM, per channel — the structural-similarity objective.
+    Optimizing it (vs plain pixel L1) rewards matching local structure/contrast,
+    which sharpens edges and lines instead of regressing toward mean colours.
+    """
+    F = torch.nn.functional
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    xc = x.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+    yc = y.permute(2, 0, 1).unsqueeze(0)
+    coords = torch.arange(win, dtype=torch.float32, device=x.device) - (win - 1) / 2.0
+    g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
+    g = g / g.sum()
+    kernel = (g[:, None] * g[None, :]).reshape(1, 1, win, win).repeat(3, 1, 1, 1)
+    pad = win // 2
+
+    def blur(t):
+        return F.conv2d(t, kernel, padding=pad, groups=3)
+
+    mu_x, mu_y = blur(xc), blur(yc)
+    mx2, my2, mxy = mu_x * mu_x, mu_y * mu_y, mu_x * mu_y
+    sx = blur(xc * xc) - mx2
+    sy = blur(yc * yc) - my2
+    sxy = blur(xc * yc) - mxy
+    ssim_map = ((2 * mxy + C1) * (2 * sxy + C2)) / ((mx2 + my2 + C1) * (sx + sy + C2))
+    return 1.0 - ssim_map.mean()
+
+
 def _emit_geometry(torch, P, scale, bg):
     """Optimized params -> geometry-JSON (importer schema). Centers int, sizes
     float, rotation int, per-shape alpha byte."""
@@ -451,6 +480,33 @@ def _emit_geometry(torch, P, scale, bg):
              int(round(col[i][2] * 255)), max(1, min(255, int(round(al[i] * 255))))]
         shapes.append({"type": typ, "data": d, "color": c, "score": 0})
     return {"shapes": shapes}
+
+
+def _pack_seed_params(torch, device, cx, cy, ex, ey, ang, isr, col, al):
+    """Pack raw seed lists into an optimizable param-dict slice that matches
+    ``_geometry_to_params`` unconstrained spaces (softplus extents, logit
+    colour/alpha), ready to ``torch.cat`` onto the live params during refine."""
+    def inv_softplus(v):
+        v = max(0.51, float(v))
+        return math.log(math.expm1(v - 0.5))
+
+    def logit(p):
+        p = min(0.999, max(0.001, float(p)))
+        return math.log(p / (1.0 - p))
+
+    def mk(xs, grad=True):
+        t = torch.tensor(xs, dtype=torch.float32, device=device)
+        return t.requires_grad_(True) if grad else t
+
+    return {
+        "cx": mk(cx), "cy": mk(cy),
+        "rex": mk([inv_softplus(v) for v in ex]),
+        "rey": mk([inv_softplus(v) for v in ey]),
+        "ang": mk(ang),
+        "rcol": mk([[logit(x) for x in c] for c in col]),
+        "ral": mk([logit(a) for a in al]),
+        "isr": mk(isr, grad=False),
+    }
 
 
 def _seed_residual_shapes(torch, target_np, render_np, n_add, device, min_area=6):
@@ -497,38 +553,173 @@ def _seed_residual_shapes(torch, target_np, render_np, n_add, device, min_area=6
         al.append(0.85)
     if not cx:
         return None
+    return _pack_seed_params(torch, device, cx, cy, ex, ey, ang, isr, col, al)
 
-    def inv_softplus(v):
-        v = max(0.51, float(v))
-        return math.log(math.expm1(v - 0.5))
 
-    def logit(p):
-        p = min(0.999, max(0.001, float(p)))
-        return math.log(p / (1.0 - p))
+def _seed_gradient_shapes(torch, target_np, n_add, device, alpha=0.35, min_score=1e-4):
+    """Seed up to ``n_add`` translucent ellipses across SMOOTH gradient regions.
 
-    def mk(xs, grad=True):
-        t = torch.tensor(xs, dtype=torch.float32, device=device)
-        return t.requires_grad_(True) if grad else t
+    Where ``_seed_residual_shapes`` recovers missing *detail* (sharp high-residual
+    blobs, near-opaque), this targets smooth SHADING — regions with a colour slope
+    but no hard edge — and seeds many LOW-ALPHA overlapping ellipses there. A
+    gradient that one flat stamp can only render as a band is then reconstructed
+    by the optimiser as the *accumulation* of these stacked translucent stamps
+    (more overlap -> more of the top colour) — the alpha-compositing degree of
+    freedom a single solid colour lacks.
 
-    return {
-        "cx": mk(cx), "cy": mk(cy),
-        "rex": mk([inv_softplus(v) for v in ex]),
-        "rey": mk([inv_softplus(v) for v in ey]),
-        "ang": mk(ang),
-        "rcol": mk([[logit(x) for x in c] for c in col]),
-        "ral": mk([logit(a) for a in al]),
-        "isr": mk(isr, grad=False),
-    }
+    Region score isolates a smooth slope from a hard edge / texture via
+    ``var(medium window) - var(small window)``: a linear ramp's variance grows
+    with window size, while a step edge or fine texture saturates both windows so
+    the difference is ~0. Seeds are placed on the highest-scoring cells of a grid
+    sized so the grid has ~2*n_add cells; stamp radius overlaps neighbours so the
+    stack can blend. Returns a param-dict slice to concatenate, or ``None``.
+    """
+    import numpy as np
+    import cv2
+
+    n_add = int(n_add)
+    if n_add <= 0:
+        return None
+    H, W = target_np.shape[:2]
+    src = np.clip(np.asarray(target_np, dtype=np.float32), 0.0, 1.0)
+    gray = cv2.cvtColor((src * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    short = max(8, min(H, W))
+    s_small = max(1.0, short / 48.0)
+    s_med = max(2.0, short / 12.0)
+
+    def _var(sig):
+        m1 = cv2.GaussianBlur(gray, (0, 0), sig)
+        m2 = cv2.GaussianBlur(gray * gray, (0, 0), sig)
+        return np.clip(m2 - m1 * m1, 0.0, None)
+
+    score = np.clip(_var(s_med) - _var(s_small), 0.0, None)  # smooth slope only
+
+    step = max(3, int(round(math.sqrt(H * W / (2.0 * n_add)))))
+    radius = max(1.5, step * 0.75)
+    pts = [(y, x) for y in range(step // 2, H, step) for x in range(step // 2, W, step)]
+    pts.sort(key=lambda p: float(score[p[0], p[1]]), reverse=True)
+
+    cx, cy, ex, ey, ang, isr, col, al = [], [], [], [], [], [], [], []
+    for y, x in pts:
+        if len(cx) >= n_add or float(score[y, x]) < min_score:
+            break
+        patch = src[max(0, y - 1):y + 2, max(0, x - 1):x + 2].reshape(-1, 3)
+        cx.append(float(x))
+        cy.append(float(y))
+        ex.append(radius)
+        ey.append(radius)
+        ang.append(0.0)
+        isr.append(0.0)  # near-circular ellipse blends smoother than a rect
+        col.append([float(c) for c in patch.mean(0)])
+        al.append(float(alpha))
+    if not cx:
+        return None
+    return _pack_seed_params(torch, device, cx, cy, ex, ey, ang, isr, col, al)
+
+
+def _seed_line_shapes(torch, target_np, n_add, device, ridge_ksize=7, thickness=2.2,
+                      alpha=0.92, approx_eps=2.0, min_seg=5.0, merge_dist=5.0,
+                      merge_ang_deg=15.0):
+    """Seed up to ``n_add`` thin rotated rects along the actual thin LINES of the
+    target (a sword, dark outlines, panel borders) — the thin features Ultra's
+    anti-sliver gate drops, which R5 (it only *moves* shapes) cannot reinvent, so
+    the dominant region paints over them.
+
+    Detection is a RIDGE filter, not Hough-on-Canny. ``HoughLinesP`` only finds
+    straight luma edges, so it missed curved anime lineart and colour boundaries,
+    double-detected each side of a stroke (overlap), and landed on the edge rather
+    than the line (wrong position). Instead:
+
+      * ridge = ``max(top-hat, black-hat)`` of the luma — isolates thin BRIGHT
+        lines (the silver sword) AND thin DARK lines (outlines) while ignoring flat
+        colour boundaries (so it does not streak filled confetti/blobs);
+      * ``findContours`` + ``approxPolyDP`` trace the ridges as polylines, which
+        follow CURVES; each segment becomes one thin rect on the line (angle =
+        local tangent, colour the median sampled along the ridge);
+      * greedy non-max suppression (close midpoint + similar angle) drops the
+        overlapping/duplicate segments.
+
+    Segments are appended so they draw on TOP; R5 refines each line's
+    length/width/colour/position. Returns a param-dict slice, or ``None``.
+    """
+    import numpy as np
+    import cv2
+
+    n_add = int(n_add)
+    if n_add <= 0:
+        return None
+    H, W = target_np.shape[:2]
+    src = np.clip(np.asarray(target_np, np.float32), 0.0, 1.0)
+    gray = cv2.cvtColor((src * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ridge_ksize, ridge_ksize))
+    bright = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, ker)    # thin bright lines
+    dark = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, ker)    # thin dark lines
+    ridge = cv2.GaussianBlur(cv2.max(bright, dark), (0, 0), 0.6)
+    _thr, mask = cv2.threshold(ridge, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if int(mask.max()) == 0:
+        return None
+    contours, _hier = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+
+    cand = []  # (p, q, length, angle_rad)
+    for c in contours:
+        if len(c) < 5:
+            continue
+        poly = cv2.approxPolyDP(c, approx_eps, False).reshape(-1, 2).astype(np.float32)
+        for k in range(len(poly) - 1):
+            p, q = poly[k], poly[k + 1]
+            seg_len = float(np.hypot(q[0] - p[0], q[1] - p[1]))
+            if seg_len >= min_seg:
+                cand.append((p, q, seg_len, math.atan2(q[1] - p[1], q[0] - p[0])))
+    if not cand:
+        return None
+    cand.sort(key=lambda s: s[2], reverse=True)
+
+    kept = []  # greedy NMS: keep longest, drop near-collinear overlaps (double edges)
+    for p, q, seg_len, ang_r in cand:
+        if len(kept) >= n_add:
+            break
+        mid = (p + q) * 0.5
+        duplicate = False
+        for kp, kq, _kl, kang in kept:
+            if np.hypot(*(mid - (kp + kq) * 0.5)) < merge_dist:
+                da = abs(ang_r - kang) % math.pi
+                if min(da, math.pi - da) < math.radians(merge_ang_deg):
+                    duplicate = True
+                    break
+        if not duplicate:
+            kept.append((p, q, seg_len, ang_r))
+
+    cx, cy, ex, ey, ang, isr, col, al = [], [], [], [], [], [], [], []
+    for p, q, seg_len, ang_r in kept:
+        mx, my = (p + q) * 0.5
+        n = max(3, int(seg_len))
+        xs = np.clip(np.linspace(p[0], q[0], n).astype(np.int32), 0, W - 1)
+        ys = np.clip(np.linspace(p[1], q[1], n).astype(np.int32), 0, H - 1)
+        c = np.median(src[ys, xs].reshape(-1, 3), axis=0)   # line colour on the ridge
+        cx.append(float(mx))
+        cy.append(float(my))
+        ex.append(max(1.0, seg_len / 2.0))            # half-length along the line
+        ey.append(max(0.75, thickness / 2.0))         # thin half-width
+        ang.append(math.degrees(ang_r))
+        isr.append(1.0)                               # rotated rect
+        col.append([float(v) for v in c])
+        al.append(float(alpha))
+    if not cx:
+        return None
+    return _pack_seed_params(torch, device, cx, cy, ex, ey, ang, isr, col, al)
 
 
 def refine_geometry(warm_data, target_rgb, opt_res=DIFF_DEFAULT_OPT_RES,
                     iters=DIFF_DEFAULT_ITERS, lr=0.01, sharp_start=4.0,
-                    sharp_end=12.0, edge_weight=1.0, add_shapes=0, chunk=256,
-                    device=None, progress=None):
+                    sharp_end=12.0, edge_weight=1.0, ssim_weight=1.0, add_shapes=0,
+                    gradient_shapes=0, edge_shapes=0, chunk=256, device=None, progress=None):
     """Globally co-optimize a warm-start geometry against ``target_rgb``.
 
-    Returns ``(refined_geometry, report)``. The shape COUNT is unchanged (the
-    importer cap still applies to ``warm_data``); every shape is re-fitted.
+    Returns ``(refined_geometry, report)``. Every warm shape is re-fitted; count
+    is unchanged unless ``gradient_shapes`` (translucent shading stamps, seeded
+    upfront) or ``add_shapes`` (residual detail stamps, seeded mid-refine) grow
+    it. Callers keep the total within the importer cap.
     """
     torch = load_torch()
     if torch is None:
@@ -544,8 +735,33 @@ def refine_geometry(warm_data, target_rgb, opt_res=DIFF_DEFAULT_OPT_RES,
     src_long = max(float(bg["data"][2]), float(bg["data"][3]))
     scale = max(H, W) / src_long
     P, bg = _geometry_to_params(torch, warm_data, scale, device)
-
     grad_keys = ("cx", "cy", "rex", "rey", "ang", "rcol", "ral")
+
+    if gradient_shapes > 0:
+        # Phase A (upfront): seed translucent stamps over smooth gradient regions
+        # so they get the full iteration budget to blend. Target-derived (no
+        # render needed), so it runs before the loop, unlike residual add-shapes.
+        gnew = _seed_gradient_shapes(torch, small, int(gradient_shapes), device)
+        if gnew is not None:
+            for k in grad_keys:
+                P[k] = torch.cat([P[k].detach(), gnew[k].detach()]).requires_grad_(True)
+            P["isr"] = torch.cat([P["isr"], gnew["isr"]])
+            if progress is not None:
+                progress(f"R5 seeded {gnew['cx'].shape[0]} translucent gradient shapes "
+                         f"(now {P['cx'].shape[0]} total)")
+
+    if edge_shapes > 0:
+        # Seed thin rects along strong straight edges (the sword / hard outlines
+        # Ultra's sliver gate dropped) on TOP, so R5 has them to refine.
+        enew = _seed_line_shapes(torch, small, int(edge_shapes), device)
+        if enew is not None:
+            for k in grad_keys:
+                P[k] = torch.cat([P[k].detach(), enew[k].detach()]).requires_grad_(True)
+            P["isr"] = torch.cat([P["isr"], enew["isr"]])
+            if progress is not None:
+                progress(f"R5 seeded {enew['cx'].shape[0]} edge/line shapes "
+                         f"(now {P['cx'].shape[0]} total)")
+
     opt = torch.optim.Adam([P[k] for k in grad_keys], lr=lr)
     tgx, tgy = _sobel(torch, target)
 
@@ -554,7 +770,10 @@ def refine_geometry(warm_data, target_rgb, opt_res=DIFF_DEFAULT_OPT_RES,
         data_l = (ren - target).abs().mean()
         rgx, rgy = _sobel(torch, ren)
         edge_l = (rgx - tgx).abs().mean() + (rgy - tgy).abs().mean()
-        return data_l + edge_weight * edge_l, ren
+        loss = data_l + edge_weight * edge_l
+        if ssim_weight > 0:
+            loss = loss + ssim_weight * _ssim_loss(torch, ren, target)
+        return loss, ren
 
     with torch.no_grad():
         l0 = float(step_loss(sharp_end)[0])
@@ -603,7 +822,8 @@ def refine_geometry(warm_data, target_rgb, opt_res=DIFF_DEFAULT_OPT_RES,
 
 def diff_refine_image(image_path, out_json_path, warm_json=None, warm_shapes=DIFF_GAME_LAYER_CAP,
                       opt_res=DIFF_DEFAULT_OPT_RES, iters=DIFF_DEFAULT_ITERS, add_shapes=0,
-                      max_resolution=1400, preview_path=None, progress=None, **kwargs):
+                      gradient_shapes=0, edge_shapes=0, max_resolution=1400, preview_path=None,
+                      progress=None, **kwargs):
     """Top-level R5: warm-start (given JSON, else run Ultra) then globally refine.
 
     Writes refined geometry-JSON (same importer schema) + optional preview and
@@ -617,9 +837,11 @@ def diff_refine_image(image_path, out_json_path, warm_json=None, warm_shapes=DIF
     started = time.perf_counter()
     image_path = Path(image_path)
     out_json_path = Path(out_json_path)
-    # Keep warm + seeded shapes within the game layer cap.
-    if add_shapes > 0:
-        warm_shapes = max(1, min(int(warm_shapes), DIFF_GAME_LAYER_CAP - int(add_shapes)))
+    # Keep warm + seeded shapes within the game layer cap (the one budget that
+    # can't be ignored: FH6 draws <= DIFF_GAME_LAYER_CAP layers, trims the rest).
+    reserve = int(add_shapes) + int(gradient_shapes) + int(edge_shapes)
+    if reserve > 0:
+        warm_shapes = max(1, min(int(warm_shapes), DIFF_GAME_LAYER_CAP - reserve))
 
     from flatten import _load_rgb
     rgb, _mask, _had = _load_rgb(image_path, max_resolution)   # (H,W,3) uint8 at <=max_res
@@ -636,7 +858,8 @@ def diff_refine_image(image_path, out_json_path, warm_json=None, warm_shapes=DIF
         warm = json.loads(warm_tmp.read_text(encoding="utf-8"))
 
     refined, report = refine_geometry(warm, rgb, opt_res=opt_res, iters=iters,
-                                      add_shapes=add_shapes, progress=progress, **kwargs)
+                                      add_shapes=add_shapes, gradient_shapes=gradient_shapes,
+                                      edge_shapes=edge_shapes, progress=progress, **kwargs)
     out_json_path.write_text(json.dumps(refined), encoding="utf-8")
     if preview_path is not None:
         from ultra import _write_preview_blend
@@ -664,9 +887,17 @@ def _main(argv=None):
     parser.add_argument("-i", "--iters", type=int, default=DIFF_DEFAULT_ITERS)
     parser.add_argument("--edge-weight", type=float, default=1.0,
                         help="weight of the anti-blur edge-gradient loss term")
+    parser.add_argument("--ssim-weight", type=float, default=1.0,
+                        help="weight of the perceptual SSIM loss term (0 disables)")
     parser.add_argument("--add-shapes", type=int, default=0,
                         help="seed N new shapes on the residual mid-refine for missing "
                              "hair/gradient detail; warm budget auto-reduced so warm+add <= game cap")
+    parser.add_argument("--gradient-shapes", type=int, default=0,
+                        help="seed N translucent ellipses on smooth gradient regions for "
+                             "alpha-stacked shading; warm budget auto-reduced so warm+grad <= game cap")
+    parser.add_argument("--edge-shapes", type=int, default=0,
+                        help="seed N thin rects along strong straight edges (swords/outlines "
+                             "Ultra's sliver gate drops); warm budget auto-reduced so warm+edge <= game cap")
     parser.add_argument("--preview", default=None, help="optional preview PNG path")
     parser.add_argument("--from-scratch", action="store_true",
                         help="legacy random-init ellipse optimizer (no warm start)")
@@ -687,7 +918,9 @@ def _main(argv=None):
         report = diff_refine_image(
             args.image, out, warm_json=args.warm, warm_shapes=args.warm_shapes,
             opt_res=args.opt_res, iters=args.iters, edge_weight=args.edge_weight,
-            add_shapes=args.add_shapes, preview_path=args.preview, progress=print,
+            ssim_weight=args.ssim_weight, add_shapes=args.add_shapes,
+            gradient_shapes=args.gradient_shapes, edge_shapes=args.edge_shapes,
+            preview_path=args.preview, progress=print,
         )
     for key, value in report.items():
         print(f"{key}: {value}")

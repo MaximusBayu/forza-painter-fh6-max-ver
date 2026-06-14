@@ -133,6 +133,14 @@ def test_diff_refine_image_with_warm_json(tmp_path: Path):
     assert "device" in report and "seconds" in report and report["layers"] == 2
 
 
+def test_ssim_loss_zero_on_identical():
+    torch = gd.load_torch()
+    x = torch.rand(24, 24, 3)
+    assert float(gd._ssim_loss(torch, x, x)) < 1e-4           # identical -> ~0
+    y = 1.0 - x
+    assert float(gd._ssim_loss(torch, x, y)) > float(gd._ssim_loss(torch, x, x))
+
+
 def test_refine_with_add_shapes_grows_count():
     # A tiny warm start leaves most of the two-tone image as residual, so the
     # mid-refine seeding pass adds new shapes to cover it.
@@ -144,5 +152,84 @@ def test_refine_with_add_shapes_grows_count():
     refined, report = gd.refine_geometry(warm, target, opt_res=48, iters=8,
                                          add_shapes=5, chunk=64, device="cpu")
     assert len(warm["shapes"]) < len(refined["shapes"]) <= len(warm["shapes"]) + 5
+    assert report["final_loss"] <= report["initial_loss"]
+    normalize_geometry_payload(refined)
+
+
+def _vertical_gradient(h=48, w=48):
+    ramp = np.linspace(40, 220, h).astype(np.uint8)[:, None]
+    img = np.zeros((h, w, 3), np.uint8)
+    img[:, :, 0] = ramp            # red rises top->bottom
+    img[:, :, 2] = (255 - ramp)    # blue falls -> a smooth gradient, no hard edge
+    return img
+
+
+def test_seed_gradient_shapes_skips_flat_image():
+    # A flat panel has no colour slope, so the smooth-gradient detector seeds
+    # nothing (var(med) - var(small) ~ 0 everywhere).
+    torch = gd.load_torch()
+    flat = np.full((32, 32, 3), 100, np.float32) / 255.0
+    assert gd._seed_gradient_shapes(torch, flat, 10, "cpu") is None
+
+
+def test_seed_gradient_shapes_targets_gradient_and_is_translucent():
+    torch = gd.load_torch()
+    grad = _vertical_gradient().astype(np.float32) / 255.0
+    seed = gd._seed_gradient_shapes(torch, grad, 16, "cpu", alpha=0.35)
+    assert seed is not None
+    assert 0 < seed["cx"].shape[0] <= 16
+    # Seeded stamps are ellipses (isr==0) and translucent (alpha ~0.35, not solid).
+    assert float(seed["isr"].abs().max()) == 0.0
+    alphas = torch.sigmoid(seed["ral"])
+    assert float(alphas.max()) < 0.6
+
+
+def test_refine_with_gradient_shapes_grows_count():
+    # A smooth gradient that flat warm stamps render as a band: gradient mode
+    # seeds translucent stamps upfront and the refit reduces loss.
+    target = _vertical_gradient()
+    warm = {"shapes": [
+        {"type": 1, "data": [0, 0, 48, 48], "color": [130, 0, 130, 255], "score": 0},
+        {"type": 1, "data": [24, 24, 46.0, 46.0], "color": [130, 0, 130, 255], "score": 0},
+    ]}
+    refined, report = gd.refine_geometry(warm, target, opt_res=48, iters=10,
+                                         gradient_shapes=20, chunk=64, device="cpu")
+    assert len(warm["shapes"]) < len(refined["shapes"]) <= len(warm["shapes"]) + 20
+    assert report["final_loss"] <= report["initial_loss"]
+    norm = normalize_geometry_payload(refined)
+    for s in norm["shapes"][1:]:
+        assert 1 <= s["color"][3] <= 255
+
+
+def _diagonal_line(h=64, w=64):
+    import cv2
+    img = np.full((h, w, 3), 235, np.uint8)
+    cv2.line(img, (6, 6), (w - 6, h - 6), (20, 20, 20), 2)  # dark diagonal on light bg
+    return img
+
+
+def test_seed_line_shapes_finds_a_line():
+    torch = gd.load_torch()
+    seed = gd._seed_line_shapes(torch, _diagonal_line().astype(np.float32) / 255.0, 10, "cpu")
+    assert seed is not None
+    assert seed["cx"].shape[0] >= 1
+    assert float(seed["isr"].min()) == 1.0                 # rotated rects, not ellipses
+    assert float(torch.sigmoid(seed["ral"]).min()) > 0.6   # near-opaque hard line
+
+
+def test_seed_line_shapes_none_on_flat():
+    torch = gd.load_torch()
+    flat = np.full((40, 40, 3), 128, np.float32) / 255.0
+    assert gd._seed_line_shapes(torch, flat, 10, "cpu") is None
+
+
+def test_refine_with_edge_shapes_grows_count():
+    # A flat warm with no draw shapes leaves the diagonal line entirely to the
+    # edge seeder; the refit then includes it and reduces loss.
+    target = _diagonal_line(64, 64)
+    warm = {"shapes": [{"type": 1, "data": [0, 0, 64, 64], "color": [235, 235, 235, 255], "score": 0}]}
+    refined, report = gd.refine_geometry(warm, target, opt_res=64, iters=8,
+                                         edge_shapes=10, chunk=64, device="cpu")
+    assert len(refined["shapes"]) > len(warm["shapes"])
     assert report["final_loss"] <= report["initial_loss"]
     normalize_geometry_payload(refined)

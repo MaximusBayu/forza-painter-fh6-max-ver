@@ -561,6 +561,10 @@ class App:
         self.ultra_shapes = StringVar(value="3000")
         self.r5_iters = StringVar(value="150")
         self.r5_opt_res = StringVar(value="384")
+        self.r5_gradient = StringVar(value="0")  # opt-in alpha-stacked gradient stamps
+        self.r5_edges = StringVar(value="0")     # opt-in thin-line/edge seeding (sword/outlines)
+        self.gen_preset = StringVar(value="")    # per-mode method preset (driven by _refresh_mode_ui)
+        self.gpu_hint_text = StringVar(value="")  # GPU scan result / recommendation
         self.processes = []
         self.photo = None
         self.use_custom_settings = StringVar(value="0")
@@ -960,8 +964,10 @@ class App:
 
         mode_row = Frame(step1)
         mode_row.pack(fill=X, padx=10, pady=(0, 2))
-        self._label(mode_row, "gen_mode").pack(side=LEFT, padx=(0, 6))
-        for value, key in (
+        self._label(mode_row, "gen_mode").pack(anchor="w")
+        mode_grid = Frame(mode_row)
+        mode_grid.pack(fill=X, pady=(2, 0))
+        for i, (value, key) in enumerate((
             ("geometrize", "mode_geometrize"),
             ("flat", "mode_flat"),
             ("superpixel", "mode_superpixel"),
@@ -969,26 +975,95 @@ class App:
             ("ultra", "mode_ultra"),
             ("ultra-diff", "mode_ultra_diff"),
             ("hybrid", "mode_hybrid"),
-        ):
-            rb = Radiobutton(mode_row, text=tr(self.lang, key), variable=self.gen_mode, value=value)
-            rb.pack(side=LEFT, padx=(4, 0))
+        )):
+            rb = Radiobutton(mode_grid, text=tr(self.lang, key), variable=self.gen_mode, value=value)
+            rb.grid(row=i // 4, column=i % 4, sticky="w", padx=(0, 12), pady=1)
             self.translated.append((rb, key, "text"))
-        params_row = Frame(step1)
-        params_row.pack(fill=X, padx=10, pady=(0, 8))
-        self._label(params_row, "flat_colors").pack(side=LEFT)
-        Entry(params_row, textvariable=self.flat_colors, width=5).pack(side=LEFT, padx=(4, 12))
-        self._label(params_row, "flat_segments").pack(side=LEFT)
-        Entry(params_row, textvariable=self.flat_segments, width=6).pack(side=LEFT, padx=(4, 12))
-        self._label(params_row, "hybrid_detail").pack(side=LEFT)
-        Entry(params_row, textvariable=self.hybrid_detail, width=6).pack(side=LEFT, padx=(4, 12))
-        self._label(params_row, "refine_shapes").pack(side=LEFT)
-        Entry(params_row, textvariable=self.refine_shapes, width=6).pack(side=LEFT, padx=(4, 12))
-        self._label(params_row, "ultra_shapes").pack(side=LEFT)
-        Entry(params_row, textvariable=self.ultra_shapes, width=6).pack(side=LEFT, padx=(4, 12))
-        self._label(params_row, "r5_iters").pack(side=LEFT)
-        Entry(params_row, textvariable=self.r5_iters, width=5).pack(side=LEFT, padx=(4, 12))
-        self._label(params_row, "r5_res").pack(side=LEFT)
-        Entry(params_row, textvariable=self.r5_opt_res, width=5).pack(side=LEFT, padx=(4, 0))
+
+        # Per-mode recommended presets. Only the active mode's preset + fields are
+        # shown (the rest are pack_forgotten) so the row never overflows the panel.
+        self.MODE_FIELDS = {
+            "geometrize": [],
+            "flat": ["flat_colors", "flat_segments"],
+            "superpixel": ["flat_segments"],
+            "refine": ["refine_shapes"],
+            "ultra": ["ultra_shapes"],
+            "ultra-diff": ["ultra_shapes", "r5_iters", "r5_res", "r5_grad", "r5_edges"],
+            "hybrid": ["flat_colors", "hybrid_detail"],
+        }
+        self.MODE_PRESETS = {
+            "flat": {
+                "Poster (fast)": {"flat_colors": "16", "flat_segments": "250"},
+                "Balanced": {"flat_colors": "24", "flat_segments": "450"},
+                "Detailed": {"flat_colors": "40", "flat_segments": "900"},
+            },
+            "superpixel": {
+                "Fast": {"flat_segments": "500"},
+                "Balanced": {"flat_segments": "1000"},
+                "Detailed": {"flat_segments": "2000"},
+            },
+            "refine": {
+                "Fast": {"refine_shapes": "800"},
+                "Balanced": {"refine_shapes": "1500"},
+                "Detailed": {"refine_shapes": "2600"},
+            },
+            "ultra": {
+                "Draft": {"ultra_shapes": "1200"},
+                "Balanced": {"ultra_shapes": "2200"},
+                "Max": {"ultra_shapes": "3000"},
+            },
+            "ultra-diff": {
+                "Fast (256px)": {"ultra_shapes": "3000", "r5_iters": "100", "r5_res": "256", "r5_grad": "0", "r5_edges": "0"},
+                "Balanced (384px)": {"ultra_shapes": "3000", "r5_iters": "150", "r5_res": "384", "r5_grad": "0", "r5_edges": "120"},
+                "Quality (512px)": {"ultra_shapes": "3000", "r5_iters": "200", "r5_res": "512", "r5_grad": "0", "r5_edges": "180"},
+                "Max (640px)": {"ultra_shapes": "3000", "r5_iters": "300", "r5_res": "640", "r5_grad": "0", "r5_edges": "250"},
+                "Gradient (512px)": {"ultra_shapes": "2000", "r5_iters": "200", "r5_res": "512", "r5_grad": "1000", "r5_edges": "120"},
+            },
+            "hybrid": {
+                "Fast": {"flat_colors": "20", "hybrid_detail": "400"},
+                "Balanced": {"flat_colors": "24", "hybrid_detail": "500"},
+                "Detailed": {"flat_colors": "32", "hybrid_detail": "900"},
+            },
+        }
+        self._default_preset = {
+            "flat": "Balanced", "superpixel": "Balanced", "refine": "Balanced",
+            "ultra": "Max", "ultra-diff": "Balanced (384px)", "hybrid": "Balanced",
+        }
+        self._field_vars = {
+            "flat_colors": self.flat_colors, "flat_segments": self.flat_segments,
+            "hybrid_detail": self.hybrid_detail, "refine_shapes": self.refine_shapes,
+            "ultra_shapes": self.ultra_shapes, "r5_iters": self.r5_iters,
+            "r5_res": self.r5_opt_res, "r5_grad": self.r5_gradient, "r5_edges": self.r5_edges,
+        }
+        _field_width = {"flat_colors": 5, "flat_segments": 6, "hybrid_detail": 6,
+                        "refine_shapes": 6, "ultra_shapes": 6, "r5_iters": 5,
+                        "r5_res": 5, "r5_grad": 5, "r5_edges": 5}
+
+        self.method_box = Frame(step1)
+        self.method_box.pack(fill=X, pady=(0, 4))
+        self.mode_note = self._label(self.method_box, "mode_geometrize_note",
+                                     anchor="w", justify=LEFT, wraplength=520, fg="#005a9e")
+        self.mode_preset_row = Frame(self.method_box)
+        self._label(self.mode_preset_row, "method_preset").pack(side=LEFT)
+        self.preset_combo = ttk.Combobox(self.mode_preset_row, textvariable=self.gen_preset,
+                                         state="readonly", width=20)
+        self.preset_combo.pack(side=LEFT, padx=(6, 0))
+        self.detect_btn = self._button(self.mode_preset_row, "detect_gpu", self.detect_gpu)
+        self.gpu_hint_label = Label(self.method_box, textvariable=self.gpu_hint_text,
+                                    anchor="w", justify=LEFT, wraplength=520,
+                                    bg=self._parent_bg(self.method_box), fg=Theme.MUTED)
+        self.mode_params_frame = Frame(self.method_box)
+        self._param_cells = {}
+        for fk in _field_width:
+            lbl = self._label(self.mode_params_frame, fk)
+            ent = Entry(self.mode_params_frame, textvariable=self._field_vars[fk], width=_field_width[fk])
+            self._param_cells[fk] = (lbl, ent)
+
+        self.gen_mode.trace_add("write", self._refresh_mode_ui)
+        self.gen_preset.trace_add("write", self._apply_mode_preset)
+        for _fv in self._field_vars.values():
+            _fv.trace_add("write", self._on_field_edit)
+        self._refresh_mode_ui()
 
         step2 = ttk.LabelFrame(left, text=tr(self.lang, "generate_step_quality"))
         self.translated.append((step2, "generate_step_quality", "text"))
@@ -1067,6 +1142,7 @@ class App:
         preview_header = Frame(right)
         preview_header.pack(fill=X)
         self._label(preview_header, "preview", anchor="w", font=("Segoe UI", 12, "bold")).pack(side=LEFT)
+        self._button(preview_header, "download_preview", self.download_preview).pack(side=LEFT, padx=(8, 0))
         self._label(preview_header, "preview_accuracy_note", anchor="e", justify=RIGHT, fg=Theme.WARN, wraplength=420).pack(side=RIGHT, fill=X, expand=True)
         self.preview_label = Label(right, text=tr(self.lang, "preview_hint"), bg="#202020", fg="#dddddd", width=60, height=24)
         self.preview_label.pack(fill=BOTH, expand=True, pady=6)
@@ -1138,6 +1214,7 @@ class App:
         import_preview_header = Frame(right)
         import_preview_header.pack(fill=X, pady=(8, 0))
         self._label(import_preview_header, "import_preview", anchor="w", font=("Segoe UI", 12, "bold")).pack(side=LEFT)
+        self._button(import_preview_header, "download_preview", self.download_preview).pack(side=LEFT, padx=(8, 0))
         self._label(import_preview_header, "preview_accuracy_note", anchor="e", justify=RIGHT, fg=Theme.WARN, wraplength=420).pack(side=RIGHT, fill=X, expand=True)
         self.import_preview_label = Label(right, text=tr(self.lang, "preview_hint"), bg="#202020", fg="#dddddd", width=56, height=20)
         self.import_preview_label.pack(fill=BOTH, expand=True, pady=6)
@@ -1210,6 +1287,95 @@ class App:
         self.tutorial_text.delete("1.0", END)
         self.tutorial_text.insert(END, tr(self.lang, "tutorial"))
         self.tutorial_text.config(state="disabled")
+
+    def _refresh_mode_ui(self, *_):
+        """Show only the active mode's preset row + fields (the rest are
+        pack_forgotten so the row can't overflow) and repopulate the preset list."""
+        mode = self.gen_mode.get()
+        fields = self.MODE_FIELDS.get(mode, [])
+        presets = self.MODE_PRESETS.get(mode, {})
+        for widget in (self.mode_note, self.mode_preset_row, self.gpu_hint_label, self.mode_params_frame):
+            widget.pack_forget()
+        for lbl, ent in self._param_cells.values():
+            lbl.grid_forget()
+            ent.grid_forget()
+        if not presets and not fields:                       # geometrize: uses Step 2 quality
+            self.mode_note.pack(fill=X, padx=10, pady=(4, 6))
+            return
+        self.mode_preset_row.pack(fill=X, padx=10, pady=(4, 2))
+        labels = list(presets.keys())
+        self.preset_combo.configure(values=labels + ["Custom"])
+        if self.gen_preset.get() not in labels + ["Custom"]:
+            self._applying_preset = True
+            self.gen_preset.set(self._default_preset.get(mode, labels[0] if labels else "Custom"))
+            self._applying_preset = False
+        if mode == "ultra-diff":
+            self.detect_btn.pack(side=LEFT, padx=(10, 0))
+            self.gpu_hint_label.pack(fill=X, padx=10, pady=(0, 2))
+        else:
+            self.detect_btn.pack_forget()
+        self.mode_params_frame.pack(fill=X, padx=10, pady=(2, 8))
+        for idx, fk in enumerate(fields):
+            lbl, ent = self._param_cells[fk]
+            r, c = divmod(idx, 3)                     # wrap 3 fields/row (no overflow)
+            lbl.grid(row=r, column=c * 2, sticky="w", padx=(0, 2), pady=1)
+            ent.grid(row=r, column=c * 2 + 1, sticky="w", padx=(0, 14), pady=1)
+        self._apply_mode_preset()
+
+    def _apply_mode_preset(self, *_):
+        """Set the active mode's field values from the chosen preset (no-op for
+        'Custom' / a foreign preset name)."""
+        if getattr(self, "_applying_preset", False):
+            return
+        presets = self.MODE_PRESETS.get(self.gen_mode.get(), {})
+        values = presets.get(self.gen_preset.get())
+        if not values:
+            return
+        self._applying_preset = True
+        for field_key, value in values.items():
+            self._field_vars[field_key].set(value)
+        self._applying_preset = False
+
+    def _on_field_edit(self, *_):
+        """A manual field edit drops the preset selection to 'Custom'."""
+        if getattr(self, "_applying_preset", False):
+            return
+        self._applying_preset = True
+        self.gen_preset.set("Custom")
+        self._applying_preset = False
+
+    def detect_gpu(self):
+        """Probe the CUDA device and recommend an Ultra+Diff preset by VRAM."""
+        try:
+            import geometry_diff
+            torch = geometry_diff.load_torch()
+        except Exception:
+            torch = None
+        if torch is None:
+            self.gpu_hint_text.set("PyTorch not installed - Ultra+Diff needs it (pip install torch).")
+            return
+        if not torch.cuda.is_available():
+            self.gpu_hint_text.set("No CUDA GPU - Ultra+Diff runs on CPU (minutes/run). Prefer Ultra (CPU).")
+            return
+        try:
+            props = torch.cuda.get_device_properties(0)
+            vram = props.total_memory / (1024 ** 3)
+            name = props.name
+        except Exception as exc:
+            self.gpu_hint_text.set(f"GPU found but probe failed: {exc}")
+            return
+        # 512px on a square image x ~3000 shapes needs ~4 GB (memory scales with
+        # H*W, not just the long edge), so keep <5 GB cards on 384 to avoid VRAM
+        # thrashing; 512/640 only when there's real headroom.
+        if vram < 5.0:
+            rec = "Balanced (384px)"
+        elif vram < 10.0:
+            rec = "Quality (512px)"
+        else:
+            rec = "Max (640px)"
+        self.gpu_hint_text.set(f"GPU: {name}  {vram:.1f} GB  ->  recommend {rec}")
+        if self.gen_mode.get() == "ultra-diff":
+            self.gen_preset.set(rec)
 
     def _update_setting_description(self, _event=None):
         item = self._selected_setting()
@@ -2078,6 +2244,43 @@ class App:
             self.import_preview_label.config(image=import_image, text="", bg="#202020")
             self.import_preview_label.image = import_image
 
+    def download_preview(self):
+        """Save the currently shown preview (rendered JSON or source image) to a
+        user-chosen PNG at full native resolution. Re-renders the active preview
+        request through the same path the display uses (so all geometry schemas
+        and the alpha blend are handled), at a large bound that caps scale at 1.0
+        (native) — preview_scale never upscales."""
+        request = self.current_preview_request
+        if not request:
+            messagebox.showinfo(tr(self.lang, "download_preview"), tr(self.lang, "no_preview"))
+            return
+        kind, path = request
+        path = Path(path)
+        if not path.exists():
+            messagebox.showinfo(tr(self.lang, "download_preview"), tr(self.lang, "no_preview"))
+            return
+        destination = filedialog.asksaveasfilename(
+            title=tr(self.lang, "download_preview"),
+            defaultextension=".png",
+            initialfile=f"{path.stem}_preview.png",
+            filetypes=[("PNG image", "*.png")],
+        )
+        if not destination:
+            return
+        try:
+            if kind == "json":
+                data = render_geometry_json(path, 4096)
+            else:
+                data = render_source_image(path, 4096)
+            if not data:
+                raise RuntimeError("renderer returned no image data")
+            Path(destination).write_bytes(data)
+        except Exception as exc:
+            self.log_line(f"Preview download failed: {exc}")
+            messagebox.showerror(tr(self.lang, "download_preview"), str(exc))
+            return
+        self.log_line(tr(self.lang, "saved_preview_to").format(path=destination))
+
     def refresh_processes(self):
         self.processes = game_processes()
         values = [item["label"] for item in self.processes]
@@ -2235,13 +2438,24 @@ class App:
                             r5_res = max(64, int(self.r5_opt_res.get()))
                         except (TypeError, ValueError):
                             r5_res = geometry_diff.DIFF_DEFAULT_OPT_RES
+                        try:
+                            r5_grad = max(0, int(self.r5_gradient.get()))
+                        except (TypeError, ValueError):
+                            r5_grad = 0
+                        try:
+                            r5_edge = max(0, int(self.r5_edges.get()))
+                        except (TypeError, ValueError):
+                            r5_edge = 0
                         dev = "GPU" if geometry_diff.load_torch().cuda.is_available() else "CPU (slow)"
+                        extra = (f" + {r5_grad} gradient" if r5_grad > 0 else "") + \
+                                (f" + {r5_edge} edge" if r5_edge > 0 else "")
                         self.queue.put(("log",
-                            f"Ultra+Diff (R5): warm {warm_budget} shapes + {r5_iters} refine "
+                            f"Ultra+Diff (R5): warm {warm_budget} shapes{extra} + {r5_iters} refine "
                             f"iters @ {r5_res}px on {dev}. Lower R5 res if out of GPU memory."))
                         report = geometry_diff.diff_refine_image(
                             input_image, out_json, warm_shapes=warm_budget, iters=r5_iters,
-                            opt_res=r5_res, preview_path=generator_preview_path(input_image),
+                            opt_res=r5_res, gradient_shapes=r5_grad, edge_shapes=r5_edge,
+                            preview_path=generator_preview_path(input_image),
                             progress=lambda msg: self.queue.put(("log", msg)),
                         )
                     elif mode == "refine":
