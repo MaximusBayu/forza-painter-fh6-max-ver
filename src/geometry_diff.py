@@ -710,10 +710,80 @@ def _seed_line_shapes(torch, target_np, n_add, device, ridge_ksize=7, thickness=
     return _pack_seed_params(torch, device, cx, cy, ex, ey, ang, isr, col, al)
 
 
+def _seed_detail_shapes(torch, target_np, n_add, device, max_blob=10.0, min_area=2,
+                        tophat_ksize=5, contrast_sigma=None, min_score=0.10, alpha=0.95):
+    """Seed up to ``n_add`` tiny opaque ellipses on small high-contrast SPOTS the
+    warm start dropped — scattered colour flecks (hat confetti) and bright
+    specular highlights (eye catchlights).
+
+    These features are only a few px wide, a tiny slice of total error, so greedy
+    Ultra spends its budget on the big regions first and never lands a shape on
+    them; R5 only *moves* shapes, so it cannot invent one and the dominant region
+    underneath shows through instead. Manually seeding the missing stamp lets R5
+    lock it onto the spot.
+
+    Two cues, combined: a colour-contrast map (``|src - local_mean|`` — the
+    saturated flecks that differ from their surroundings) and a luma TOP-HAT (the
+    small bright sparkles). Only SMALL connected components pass (``max_blob`` cap
+    — big regions are already covered by warm shapes); each becomes one tiny
+    opaque ellipse coloured by its median. Target-derived, so seeded upfront for
+    the full iteration budget. Returns a param-dict slice, or ``None``.
+    """
+    import numpy as np
+    import cv2
+
+    n_add = int(n_add)
+    if n_add <= 0:
+        return None
+    H, W = target_np.shape[:2]
+    src = np.clip(np.asarray(target_np, np.float32), 0.0, 1.0)
+    short = max(8, min(H, W))
+    sig = contrast_sigma if contrast_sigma else max(2.0, short / 64.0)
+    local_mean = cv2.GaussianBlur(src, (0, 0), sig)
+    contrast = np.abs(src - local_mean).sum(2)            # local colour deviation, 0..3
+    gray = cv2.cvtColor((src * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tophat_ksize, tophat_ksize))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, ker).astype(np.float32) / 255.0
+    score = np.maximum(contrast, tophat * 3.0)            # bring tophat into 0..3 range
+    mask = (score >= min_score).astype(np.uint8)
+    if int(mask.max()) == 0:
+        return None
+    n_comp, lbl, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
+    if n_comp <= 1:
+        return None
+
+    cand = []  # (peak_score, comp, w, h) — only small compact spots
+    for comp in range(1, n_comp):
+        area = stats[comp, cv2.CC_STAT_AREA]
+        w = stats[comp, cv2.CC_STAT_WIDTH]
+        h = stats[comp, cv2.CC_STAT_HEIGHT]
+        if area < min_area or max(w, h) > max_blob:
+            continue
+        cand.append((float(score[lbl == comp].max()), comp, w, h))
+    if not cand:
+        return None
+    cand.sort(reverse=True)  # strongest spots first
+
+    cx, cy, ex, ey, ang, isr, col, al = [], [], [], [], [], [], [], []
+    for _peak, comp, w, h in cand[:n_add]:
+        cx.append(float(cent[comp][0]))
+        cy.append(float(cent[comp][1]))
+        ex.append(max(0.75, w / 2.0))
+        ey.append(max(0.75, h / 2.0))
+        ang.append(0.0)
+        isr.append(0.0)  # round spot -> ellipse
+        col.append([float(c) for c in np.median(src[lbl == comp].reshape(-1, 3), axis=0)])
+        al.append(float(alpha))
+    if not cx:
+        return None
+    return _pack_seed_params(torch, device, cx, cy, ex, ey, ang, isr, col, al)
+
+
 def refine_geometry(warm_data, target_rgb, opt_res=DIFF_DEFAULT_OPT_RES,
                     iters=DIFF_DEFAULT_ITERS, lr=0.01, sharp_start=4.0,
                     sharp_end=12.0, edge_weight=1.0, ssim_weight=1.0, add_shapes=0,
-                    gradient_shapes=0, edge_shapes=0, chunk=256, device=None, progress=None):
+                    gradient_shapes=0, edge_shapes=0, detail_shapes=0, chunk=256,
+                    device=None, progress=None):
     """Globally co-optimize a warm-start geometry against ``target_rgb``.
 
     Returns ``(refined_geometry, report)``. Every warm shape is re-fitted; count
@@ -760,6 +830,18 @@ def refine_geometry(warm_data, target_rgb, opt_res=DIFF_DEFAULT_OPT_RES,
             P["isr"] = torch.cat([P["isr"], enew["isr"]])
             if progress is not None:
                 progress(f"R5 seeded {enew['cx'].shape[0]} edge/line shapes "
+                         f"(now {P['cx'].shape[0]} total)")
+
+    if detail_shapes > 0:
+        # Seed tiny opaque ellipses on small high-contrast spots (colour flecks,
+        # specular sparkles) the warm start dropped, on TOP for R5 to refine.
+        dnew = _seed_detail_shapes(torch, small, int(detail_shapes), device)
+        if dnew is not None:
+            for k in grad_keys:
+                P[k] = torch.cat([P[k].detach(), dnew[k].detach()]).requires_grad_(True)
+            P["isr"] = torch.cat([P["isr"], dnew["isr"]])
+            if progress is not None:
+                progress(f"R5 seeded {dnew['cx'].shape[0]} detail/spot shapes "
                          f"(now {P['cx'].shape[0]} total)")
 
     opt = torch.optim.Adam([P[k] for k in grad_keys], lr=lr)
@@ -822,8 +904,8 @@ def refine_geometry(warm_data, target_rgb, opt_res=DIFF_DEFAULT_OPT_RES,
 
 def diff_refine_image(image_path, out_json_path, warm_json=None, warm_shapes=DIFF_GAME_LAYER_CAP,
                       opt_res=DIFF_DEFAULT_OPT_RES, iters=DIFF_DEFAULT_ITERS, add_shapes=0,
-                      gradient_shapes=0, edge_shapes=0, max_resolution=1400, preview_path=None,
-                      progress=None, **kwargs):
+                      gradient_shapes=0, edge_shapes=0, detail_shapes=0,
+                      max_resolution=1400, preview_path=None, progress=None, **kwargs):
     """Top-level R5: warm-start (given JSON, else run Ultra) then globally refine.
 
     Writes refined geometry-JSON (same importer schema) + optional preview and
@@ -839,7 +921,7 @@ def diff_refine_image(image_path, out_json_path, warm_json=None, warm_shapes=DIF
     out_json_path = Path(out_json_path)
     # Keep warm + seeded shapes within the game layer cap (the one budget that
     # can't be ignored: FH6 draws <= DIFF_GAME_LAYER_CAP layers, trims the rest).
-    reserve = int(add_shapes) + int(gradient_shapes) + int(edge_shapes)
+    reserve = int(add_shapes) + int(gradient_shapes) + int(edge_shapes) + int(detail_shapes)
     if reserve > 0:
         warm_shapes = max(1, min(int(warm_shapes), DIFF_GAME_LAYER_CAP - reserve))
 
@@ -859,7 +941,8 @@ def diff_refine_image(image_path, out_json_path, warm_json=None, warm_shapes=DIF
 
     refined, report = refine_geometry(warm, rgb, opt_res=opt_res, iters=iters,
                                       add_shapes=add_shapes, gradient_shapes=gradient_shapes,
-                                      edge_shapes=edge_shapes, progress=progress, **kwargs)
+                                      edge_shapes=edge_shapes, detail_shapes=detail_shapes,
+                                      progress=progress, **kwargs)
     out_json_path.write_text(json.dumps(refined), encoding="utf-8")
     if preview_path is not None:
         from ultra import _write_preview_blend
@@ -898,6 +981,10 @@ def _main(argv=None):
     parser.add_argument("--edge-shapes", type=int, default=0,
                         help="seed N thin rects along strong straight edges (swords/outlines "
                              "Ultra's sliver gate drops); warm budget auto-reduced so warm+edge <= game cap")
+    parser.add_argument("--detail-shapes", type=int, default=0,
+                        help="seed N tiny opaque ellipses on small high-contrast spots (colour "
+                             "flecks, specular sparkles) the warm start dropped; warm budget "
+                             "auto-reduced so warm+detail <= game cap")
     parser.add_argument("--preview", default=None, help="optional preview PNG path")
     parser.add_argument("--from-scratch", action="store_true",
                         help="legacy random-init ellipse optimizer (no warm start)")
@@ -920,6 +1007,7 @@ def _main(argv=None):
             opt_res=args.opt_res, iters=args.iters, edge_weight=args.edge_weight,
             ssim_weight=args.ssim_weight, add_shapes=args.add_shapes,
             gradient_shapes=args.gradient_shapes, edge_shapes=args.edge_shapes,
+            detail_shapes=args.detail_shapes,
             preview_path=args.preview, progress=print,
         )
     for key, value in report.items():

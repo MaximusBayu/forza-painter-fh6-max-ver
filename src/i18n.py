@@ -50,6 +50,7 @@ TEXT = {
         "r5_res": "R5 res",
         "r5_grad": "R5 gradient",
         "r5_edges": "R5 edges",
+        "r5_detail": "R5 detail",
         "method_preset": "Preset",
         "detect_gpu": "Detect GPU",
         "download_preview": "Download preview",

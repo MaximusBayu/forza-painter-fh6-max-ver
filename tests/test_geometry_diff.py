@@ -233,3 +233,39 @@ def test_refine_with_edge_shapes_grows_count():
     assert len(refined["shapes"]) > len(warm["shapes"])
     assert report["final_loss"] <= report["initial_loss"]
     normalize_geometry_payload(refined)
+
+
+def _spot_image(h=64, w=64):
+    img = np.full((h, w, 3), 128, np.uint8)  # mid-grey field
+    for (cy, cx) in [(16, 16), (16, 48), (48, 16), (48, 48)]:
+        img[cy - 1:cy + 1, cx - 1:cx + 1] = (250, 250, 250)  # tiny bright specks
+    return img
+
+
+def test_seed_detail_shapes_finds_spots():
+    torch = gd.load_torch()
+    seed = gd._seed_detail_shapes(torch, _spot_image().astype(np.float32) / 255.0, 10, "cpu")
+    assert seed is not None
+    assert seed["cx"].shape[0] >= 1
+    assert float(seed["isr"].max()) == 0.0                 # tiny ellipses, not rects
+    assert float(torch.sigmoid(seed["ral"]).min()) > 0.6   # near-opaque spots
+    extent = torch.nn.functional.softplus(seed["rex"]) + 0.5
+    assert float(extent.max()) < 8.0                        # small stamps (spots, not regions)
+
+
+def test_seed_detail_shapes_none_on_flat():
+    torch = gd.load_torch()
+    flat = np.full((40, 40, 3), 128, np.float32) / 255.0
+    assert gd._seed_detail_shapes(torch, flat, 10, "cpu") is None
+
+
+def test_refine_with_detail_shapes_grows_count():
+    # A flat warm leaves the bright specks to the detail seeder; the refit then
+    # includes them and does not increase loss.
+    target = _spot_image(64, 64)
+    warm = {"shapes": [{"type": 1, "data": [0, 0, 64, 64], "color": [128, 128, 128, 255], "score": 0}]}
+    refined, report = gd.refine_geometry(warm, target, opt_res=64, iters=8,
+                                         detail_shapes=10, chunk=64, device="cpu")
+    assert len(refined["shapes"]) > len(warm["shapes"])
+    assert report["final_loss"] <= report["initial_loss"]
+    normalize_geometry_payload(refined)

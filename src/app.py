@@ -563,6 +563,7 @@ class App:
         self.r5_opt_res = StringVar(value="384")
         self.r5_gradient = StringVar(value="0")  # opt-in alpha-stacked gradient stamps
         self.r5_edges = StringVar(value="0")     # opt-in thin-line/edge seeding (sword/outlines)
+        self.r5_detail = StringVar(value="0")    # opt-in tiny-spot seeding (flecks/sparkles)
         self.gen_preset = StringVar(value="")    # per-mode method preset (driven by _refresh_mode_ui)
         self.gpu_hint_text = StringVar(value="")  # GPU scan result / recommendation
         self.processes = []
@@ -988,7 +989,7 @@ class App:
             "superpixel": ["flat_segments"],
             "refine": ["refine_shapes"],
             "ultra": ["ultra_shapes"],
-            "ultra-diff": ["ultra_shapes", "r5_iters", "r5_res", "r5_grad", "r5_edges"],
+            "ultra-diff": ["ultra_shapes", "r5_iters", "r5_res", "r5_grad", "r5_edges", "r5_detail"],
             "hybrid": ["flat_colors", "hybrid_detail"],
         }
         self.MODE_PRESETS = {
@@ -1013,11 +1014,11 @@ class App:
                 "Max": {"ultra_shapes": "3000"},
             },
             "ultra-diff": {
-                "Fast (256px)": {"ultra_shapes": "3000", "r5_iters": "100", "r5_res": "256", "r5_grad": "0", "r5_edges": "0"},
-                "Balanced (384px)": {"ultra_shapes": "3000", "r5_iters": "150", "r5_res": "384", "r5_grad": "0", "r5_edges": "120"},
-                "Quality (512px)": {"ultra_shapes": "3000", "r5_iters": "200", "r5_res": "512", "r5_grad": "0", "r5_edges": "180"},
-                "Max (640px)": {"ultra_shapes": "3000", "r5_iters": "300", "r5_res": "640", "r5_grad": "0", "r5_edges": "250"},
-                "Gradient (512px)": {"ultra_shapes": "2000", "r5_iters": "200", "r5_res": "512", "r5_grad": "1000", "r5_edges": "120"},
+                "Fast (256px)": {"ultra_shapes": "3000", "r5_iters": "100", "r5_res": "256", "r5_grad": "0", "r5_edges": "0", "r5_detail": "0"},
+                "Balanced (384px)": {"ultra_shapes": "3000", "r5_iters": "150", "r5_res": "384", "r5_grad": "0", "r5_edges": "120", "r5_detail": "0"},
+                "Quality (512px)": {"ultra_shapes": "3000", "r5_iters": "200", "r5_res": "512", "r5_grad": "0", "r5_edges": "180", "r5_detail": "60"},
+                "Max (640px)": {"ultra_shapes": "3000", "r5_iters": "300", "r5_res": "640", "r5_grad": "0", "r5_edges": "250", "r5_detail": "97"},
+                "Gradient (512px)": {"ultra_shapes": "2000", "r5_iters": "200", "r5_res": "512", "r5_grad": "1000", "r5_edges": "120", "r5_detail": "0"},
             },
             "hybrid": {
                 "Fast": {"flat_colors": "20", "hybrid_detail": "400"},
@@ -1034,10 +1035,11 @@ class App:
             "hybrid_detail": self.hybrid_detail, "refine_shapes": self.refine_shapes,
             "ultra_shapes": self.ultra_shapes, "r5_iters": self.r5_iters,
             "r5_res": self.r5_opt_res, "r5_grad": self.r5_gradient, "r5_edges": self.r5_edges,
+            "r5_detail": self.r5_detail,
         }
         _field_width = {"flat_colors": 5, "flat_segments": 6, "hybrid_detail": 6,
                         "refine_shapes": 6, "ultra_shapes": 6, "r5_iters": 5,
-                        "r5_res": 5, "r5_grad": 5, "r5_edges": 5}
+                        "r5_res": 5, "r5_grad": 5, "r5_edges": 5, "r5_detail": 5}
 
         self.method_box = Frame(step1)
         self.method_box.pack(fill=X, pady=(0, 4))
@@ -2446,15 +2448,21 @@ class App:
                             r5_edge = max(0, int(self.r5_edges.get()))
                         except (TypeError, ValueError):
                             r5_edge = 0
+                        try:
+                            r5_det = max(0, int(self.r5_detail.get()))
+                        except (TypeError, ValueError):
+                            r5_det = 0
                         dev = "GPU" if geometry_diff.load_torch().cuda.is_available() else "CPU (slow)"
                         extra = (f" + {r5_grad} gradient" if r5_grad > 0 else "") + \
-                                (f" + {r5_edge} edge" if r5_edge > 0 else "")
+                                (f" + {r5_edge} edge" if r5_edge > 0 else "") + \
+                                (f" + {r5_det} detail" if r5_det > 0 else "")
                         self.queue.put(("log",
                             f"Ultra+Diff (R5): warm {warm_budget} shapes{extra} + {r5_iters} refine "
                             f"iters @ {r5_res}px on {dev}. Lower R5 res if out of GPU memory."))
                         report = geometry_diff.diff_refine_image(
                             input_image, out_json, warm_shapes=warm_budget, iters=r5_iters,
                             opt_res=r5_res, gradient_shapes=r5_grad, edge_shapes=r5_edge,
+                            detail_shapes=r5_det,
                             preview_path=generator_preview_path(input_image),
                             progress=lambda msg: self.queue.put(("log", msg)),
                         )
